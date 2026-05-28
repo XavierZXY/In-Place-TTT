@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ruff: noqa: E402,I001
+
 import json
 import math
 import os
 import ast
+import copy
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -74,16 +77,44 @@ from veomni.utils.device import (
     synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
+try:
+    from tasks.eval_control import should_run_eval
+except ImportError:
+    from eval_control import should_run_eval
 
 
 logger = helper.create_logger(__name__)
 
 
 @dataclass
+class EvalDataArguments(DataArguments):
+    eval_path: str | None = field(
+        default=None,
+        metadata={"help": "Held-out eval data path. When unset, eval loss is disabled."},
+    )
+    eval_datasets_type: str = field(
+        default="mapping",
+        metadata={"help": "Dataset type for held-out eval data."},
+    )
+
+
+@dataclass
+class EvalTrainingArguments(TrainingArguments):
+    eval_steps: int = field(
+        default=0,
+        metadata={"help": "Run held-out eval every N global steps. 0 disables eval."},
+    )
+    eval_batches: int = field(
+        default=8,
+        metadata={"help": "Number of eval dataloader steps per eval run."},
+    )
+
+
+@dataclass
 class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
-    data: "DataArguments" = field(default_factory=DataArguments)
-    train: "TrainingArguments" = field(default_factory=TrainingArguments)
+    data: "EvalDataArguments" = field(default_factory=EvalDataArguments)
+    train: "EvalTrainingArguments" = field(default_factory=EvalTrainingArguments)
 
 
 def _filter_kwargs_for_callable(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -168,6 +199,82 @@ def _build_dataloader_compat(args, train_dataset, train_steps):
     return build_dataloader(dataloader_type=args.data.dataloader_type, **dataloader_kwargs)
 
 
+def _args_for_eval(args):
+    eval_args = copy.copy(args)
+    eval_args.data = copy.copy(args.data)
+    eval_args.data.train_path = args.data.eval_path
+    eval_args.data.datasets_type = args.data.eval_datasets_type
+    eval_args.data.enable_multisource = str(args.data.eval_path).endswith(".yaml")
+    eval_args.data.dataset_name = (
+        eval_args.data.multisource_datasets_type if eval_args.data.enable_multisource else args.data.eval_datasets_type
+    )
+    return eval_args
+
+
+def _build_dataset_for_args(args, transform):
+    return build_dataset(
+        dataset_name=args.data.dataset_name,
+        transform=transform,
+        dataloader_batch_size=args.train.dataloader_batch_size,
+        seed=args.train.seed,
+        **asdict(args.data),
+    )
+
+
+def _move_micro_batch_to_device(micro_batch: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value.to(get_device_type(), non_blocking=True) if isinstance(value, torch.Tensor) else value
+        for key, value in micro_batch.items()
+    }
+
+
+def _strip_multisource_fields(micro_batch: Dict[str, Any]) -> None:
+    micro_batch.pop("ds_idx", None)
+    micro_batch.pop("cur_token_num", None)
+    micro_batch.pop("source_name", None)
+
+
+def _run_eval_loss(model, eval_dataloader, eval_batches: int, enable_multisource: bool, model_fwd_context):
+    model.eval()
+    total_eval_loss = 0.0
+    evaluated_batches = 0
+    eval_iterator = iter(eval_dataloader)
+
+    with torch.no_grad():
+        for _ in range(eval_batches):
+            try:
+                micro_batches: List[Dict[str, Any]] = next(eval_iterator)
+            except StopIteration:
+                break
+
+            length_in_batch = torch.tensor(0, dtype=torch.int32, device=get_device_type())
+            for micro_batch in micro_batches:
+                length_in_batch += torch.sum(micro_batch["labels"] != IGNORE_INDEX)
+            length_in_batch = all_reduce(length_in_batch, op="sum", group=get_parallel_state().fsdp_group)
+            if length_in_batch == 0:
+                continue
+
+            batch_loss = 0.0
+            for micro_batch in micro_batches:
+                if enable_multisource:
+                    _strip_multisource_fields(micro_batch)
+                micro_batch = _move_micro_batch_to_device(micro_batch)
+                with model_fwd_context:
+                    model_outputs = model(**micro_batch, use_cache=False)
+                length_in_micro_batch = torch.sum(micro_batch["labels"] != IGNORE_INDEX)
+                loss = model_outputs.loss * length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
+                batch_loss += loss.item()
+                del micro_batch
+
+            total_eval_loss += all_reduce(batch_loss, group=get_parallel_state().fsdp_group)
+            evaluated_batches += 1
+
+    model.train()
+    if evaluated_batches == 0:
+        return None
+    return total_eval_loss / evaluated_batches
+
+
 def main():
     foundation_override = _pop_dict_cli_arg("--model.foundation")
 
@@ -234,18 +341,19 @@ def main():
     else:
         raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
 
-    train_dataset = build_dataset(
-        dataset_name=args.data.dataset_name,
-        transform=transform,
-        dataloader_batch_size=args.train.dataloader_batch_size,
-        seed=args.train.seed,
-        **asdict(args.data),
-    )
+    train_dataset = _build_dataset_for_args(args, transform)
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
         dataset_length = dataset_length / args.train.data_parallel_size
     train_steps = _compute_train_steps_compat(args, dataset_length)
     train_dataloader = _build_dataloader_compat(args, train_dataset, train_steps)
+    eval_dataloader = None
+    eval_enable_multisource = False
+    if args.data.eval_path and args.train.eval_steps > 0 and args.train.eval_batches > 0:
+        eval_args = _args_for_eval(args)
+        eval_enable_multisource = eval_args.data.enable_multisource
+        eval_dataset = _build_dataset_for_args(eval_args, transform)
+        eval_dataloader = _build_dataloader_compat(eval_args, eval_dataset, args.train.eval_batches)
 
     logger.info_rank0("Prepare model")
     model = build_foundation_model(
@@ -399,14 +507,9 @@ def main():
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
                 if args.data.enable_multisource:
-                    micro_batch.pop("ds_idx", None)
-                    micro_batch.pop("cur_token_num", None)
-                    micro_batch.pop("source_name", None)
+                    _strip_multisource_fields(micro_batch)
 
-                micro_batch = {
-                    k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
-                    for k, v in micro_batch.items()
-                }
+                micro_batch = _move_micro_batch_to_device(micro_batch)
                 with model_fwd_context:
                     model_outputs = model(**micro_batch, use_cache=False)
 
@@ -447,6 +550,24 @@ def main():
                         {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
                     )
                     wandb.log(train_metrics, step=global_step)
+
+            if eval_dataloader is not None and should_run_eval(
+                args.data.eval_path,
+                args.train.eval_steps,
+                args.train.eval_batches,
+                global_step,
+            ):
+                eval_loss = _run_eval_loss(
+                    model,
+                    eval_dataloader,
+                    args.train.eval_batches,
+                    eval_enable_multisource,
+                    model_fwd_context,
+                )
+                if eval_loss is not None and args.train.global_rank == 0:
+                    logger.info_rank0(f"Eval loss at global_step {global_step}: {eval_loss:.4f}")
+                    if args.train.use_wandb:
+                        wandb.log({"eval/loss": eval_loss}, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
                 profiler.step()

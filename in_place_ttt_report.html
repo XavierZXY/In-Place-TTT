@@ -1,0 +1,895 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>In-Place TTT 项目阅读报告</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --paper: #ffffff;
+      --ink: #172033;
+      --muted: #647084;
+      --line: #d8dee9;
+      --blue: #2563eb;
+      --green: #0f8f75;
+      --amber: #b7791f;
+      --red: #c2410c;
+      --purple: #7c3aed;
+      --slate: #334155;
+      --soft-blue: #e8f0ff;
+      --soft-green: #e7f7f2;
+      --soft-amber: #fff4da;
+      --soft-red: #fff0e8;
+      --soft-purple: #f2ebff;
+      --shadow: 0 18px 48px rgba(23, 32, 51, 0.09);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.68;
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    code {
+      padding: 0.15rem 0.35rem;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: #f8fafc;
+      color: #0f172a;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+
+    .shell {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 28px 22px 56px;
+    }
+
+    .hero {
+      min-height: 58vh;
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+      gap: 28px;
+      align-items: center;
+      padding: 42px 0 26px;
+    }
+
+    .hero-copy {
+      padding-right: 12px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--green);
+      font-size: 0.82rem;
+      font-weight: 800;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 760px;
+      font-size: clamp(2.3rem, 6vw, 5rem);
+      line-height: 1.03;
+      letter-spacing: 0;
+    }
+
+    .lead {
+      margin: 22px 0 0;
+      max-width: 720px;
+      color: var(--slate);
+      font-size: 1.08rem;
+    }
+
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.8);
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-weight: 650;
+    }
+
+    .hero-visual {
+      min-height: 360px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background:
+        linear-gradient(135deg, rgba(37, 99, 235, 0.08), transparent 42%),
+        linear-gradient(225deg, rgba(15, 143, 117, 0.09), transparent 40%),
+        #ffffff;
+      box-shadow: var(--shadow);
+    }
+
+    .hero-visual svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+      min-height: 360px;
+    }
+
+    .toc {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 12px 0 34px;
+    }
+
+    .toc a {
+      min-height: 70px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      color: var(--ink);
+      box-shadow: 0 8px 24px rgba(23, 32, 51, 0.05);
+    }
+
+    .toc b {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 0.96rem;
+    }
+
+    .toc span {
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    section {
+      margin: 24px 0;
+      padding: 28px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      box-shadow: 0 10px 30px rgba(23, 32, 51, 0.045);
+    }
+
+    h2 {
+      margin: 0 0 16px;
+      font-size: 1.58rem;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 22px 0 10px;
+      color: #243044;
+      font-size: 1.06rem;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 12px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 18px;
+    }
+
+    .metric,
+    .file-card,
+    .finding,
+    .note {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    .metric {
+      padding: 16px;
+    }
+
+    .metric strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 1.45rem;
+      line-height: 1.2;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .architecture {
+      display: grid;
+      grid-template-columns: 0.95fr 1.05fr;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .diagram {
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+    }
+
+    .diagram svg {
+      display: block;
+      min-width: 720px;
+      width: 100%;
+      height: auto;
+    }
+
+    .file-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .file-card {
+      padding: 15px;
+    }
+
+    .file-card h3 {
+      margin-top: 0;
+      font-size: 1rem;
+    }
+
+    .file-card ul,
+    .finding ul,
+    .checklist,
+    .plain-list {
+      margin: 10px 0 0;
+      padding-left: 1.15rem;
+    }
+
+    .file-card li,
+    .finding li,
+    .checklist li,
+    .plain-list li {
+      margin: 6px 0;
+    }
+
+    .findings {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .finding {
+      padding: 16px;
+    }
+
+    .finding .tag {
+      display: inline-block;
+      margin-bottom: 8px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 800;
+    }
+
+    .tag-blue {
+      background: var(--soft-blue);
+      color: var(--blue);
+    }
+
+    .tag-green {
+      background: var(--soft-green);
+      color: var(--green);
+    }
+
+    .tag-amber {
+      background: var(--soft-amber);
+      color: var(--amber);
+    }
+
+    .tag-purple {
+      background: var(--soft-purple);
+      color: var(--purple);
+    }
+
+    .tag-red {
+      background: var(--soft-red);
+      color: var(--red);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 14px;
+      font-size: 0.94rem;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f8fafc;
+      color: #243044;
+      font-weight: 750;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .formula {
+      margin: 14px 0;
+      padding: 14px 16px;
+      border-left: 4px solid var(--green);
+      border-radius: 6px;
+      background: #f3fbf8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(130px, 1fr));
+      gap: 10px;
+      margin: 18px 0 4px;
+    }
+
+    .flow-step {
+      position: relative;
+      min-height: 122px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+    }
+
+    .flow-step::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      right: -10px;
+      width: 10px;
+      border-top: 2px solid #b6c1d4;
+    }
+
+    .flow-step:last-child::after {
+      display: none;
+    }
+
+    .flow-step b {
+      display: block;
+      margin-bottom: 7px;
+      color: var(--blue);
+    }
+
+    .note {
+      margin-top: 16px;
+      padding: 14px 16px;
+      background: #fffdf7;
+      border-color: #ead7a3;
+    }
+
+    .code-map {
+      display: grid;
+      grid-template-columns: 210px 1fr;
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .code-map .label {
+      padding: 12px 14px;
+      border-radius: 8px;
+      color: #fff;
+      font-weight: 800;
+    }
+
+    .label.train {
+      background: var(--blue);
+    }
+
+    .label.infer {
+      background: var(--green);
+    }
+
+    .label.config {
+      background: var(--amber);
+    }
+
+    .label.ops {
+      background: var(--purple);
+    }
+
+    .code-map .content {
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    .refs {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .ref {
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    @media (max-width: 900px) {
+      .hero,
+      .architecture,
+      .summary-grid,
+      .file-grid,
+      .findings,
+      .refs {
+        grid-template-columns: 1fr;
+      }
+
+      .toc {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      .flow-step::after {
+        top: auto;
+        right: 50%;
+        bottom: -10px;
+        height: 10px;
+        width: 0;
+        border-top: 0;
+        border-left: 2px solid #b6c1d4;
+      }
+
+      .code-map {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .shell {
+        padding: 18px 12px 42px;
+      }
+
+      section {
+        padding: 20px 16px;
+      }
+
+      .toc {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">项目阅读报告</p>
+        <h1>In-Place Test-Time Training</h1>
+        <p class="lead">
+          这个仓库把论文中的 In-Place TTT 落到 Qwen3 和 LLaMA 的 HuggingFace 模型实现中：
+          不新增外部记忆或替换 Attention，而是在选中 Transformer 层的 MLP <code>down_proj</code> 上实现 fast weight 更新。
+        </p>
+        <div class="hero-meta">
+          <span class="pill">训练路径：<code>hf_models/</code></span>
+          <span class="pill">推理路径：<code>inference_model/</code></span>
+          <span class="pill">论文：<code>papers/sections/approach.tex</code></span>
+        </div>
+      </div>
+      <div class="hero-visual" aria-label="In-Place TTT 总览图">
+        <svg viewBox="0 0 760 430" role="img">
+          <defs>
+            <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+              <path d="M0,0 L12,6 L0,12 z" fill="#334155"></path>
+            </marker>
+            <linearGradient id="blockGrad" x1="0" x2="1">
+              <stop offset="0" stop-color="#e8f0ff"></stop>
+              <stop offset="1" stop-color="#e7f7f2"></stop>
+            </linearGradient>
+          </defs>
+          <rect x="0" y="0" width="760" height="430" fill="transparent"></rect>
+          <text x="40" y="54" font-size="24" font-weight="800" fill="#172033">标准 Transformer 块内的 TTT</text>
+          <text x="40" y="83" font-size="14" fill="#647084">Attention 保持不变；MLP 的 down projection 成为可在线更新的 fast weights。</text>
+
+          <rect x="56" y="130" width="138" height="58" rx="8" fill="#fff" stroke="#d8dee9"></rect>
+          <text x="88" y="164" font-size="15" font-weight="700" fill="#172033">Hidden H</text>
+
+          <line x1="194" y1="159" x2="256" y2="159" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"></line>
+          <rect x="256" y="112" width="188" height="96" rx="8" fill="url(#blockGrad)" stroke="#9fb2d6"></rect>
+          <text x="287" y="143" font-size="15" font-weight="800" fill="#172033">Gated MLP</text>
+          <text x="283" y="169" font-size="13" fill="#334155">Z = act(gate(H)) * up(H)</text>
+          <text x="290" y="191" font-size="13" fill="#334155">W_gate / W_up 是 slow weights</text>
+
+          <line x1="444" y1="159" x2="510" y2="159" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"></line>
+          <rect x="510" y="118" width="174" height="82" rx="8" fill="#fff4da" stroke="#d7ae55"></rect>
+          <text x="536" y="149" font-size="15" font-weight="800" fill="#172033">down_proj</text>
+          <text x="530" y="174" font-size="13" fill="#334155">W_down + ΔW</text>
+
+          <path d="M600 200 C600 246, 535 268, 466 284" fill="none" stroke="#0f8f75" stroke-width="3" marker-end="url(#arrow)"></path>
+          <rect x="110" y="276" width="182" height="72" rx="8" fill="#f2ebff" stroke="#b89df5"></rect>
+          <text x="132" y="306" font-size="15" font-weight="800" fill="#172033">LM-aligned target</text>
+          <text x="131" y="330" font-size="13" fill="#334155">V = Conv1D(target) · W_target</text>
+
+          <line x1="292" y1="312" x2="355" y2="312" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"></line>
+          <rect x="355" y="276" width="178" height="72" rx="8" fill="#e7f7f2" stroke="#86c8b7"></rect>
+          <text x="386" y="306" font-size="15" font-weight="800" fill="#172033">Chunk update</text>
+          <text x="380" y="330" font-size="13" fill="#334155">ΔW_i = η · V_i^T · Z_i</text>
+
+          <path d="M444 276 C454 235, 486 213, 530 196" fill="none" stroke="#0f8f75" stroke-width="3" marker-end="url(#arrow)"></path>
+
+          <rect x="56" y="376" width="628" height="28" rx="8" fill="#eef2f7"></rect>
+          <rect x="66" y="382" width="126" height="16" rx="5" fill="#2563eb"></rect>
+          <rect x="202" y="382" width="126" height="16" rx="5" fill="#0f8f75"></rect>
+          <rect x="338" y="382" width="126" height="16" rx="5" fill="#b7791f"></rect>
+          <rect x="474" y="382" width="126" height="16" rx="5" fill="#7c3aed"></rect>
+          <text x="68" y="420" font-size="12" fill="#647084">按 chunk 串行语义 / 并行 scan 实现</text>
+        </svg>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="报告目录">
+      <a href="#project"><b>项目结构</b><span>仓库模块与运行链路</span></a>
+      <a href="#algorithm"><b>算法主线</b><span>论文方法到公式</span></a>
+      <a href="#implementation"><b>关键改动</b><span>代码位置和职责</span></a>
+      <a href="#notes"><b>注意点</b><span>训练、推理、边界</span></a>
+    </nav>
+
+    <section id="project">
+      <h2>项目整体结构</h2>
+      <p>
+        仓库不是从零实现一个训练框架，而是在 VeOmni/HuggingFace 模型栈上增加 In-Place TTT 能力。
+        入口脚本负责训练、转换和评测；关键算法主要集中在自定义模型文件，而不是训练循环本身。
+      </p>
+
+      <div class="summary-grid">
+        <div class="metric">
+          <strong>4 条主链路</strong>
+          <span>训练、checkpoint 转换、推理、OpenCompass/RULER 评测。</span>
+        </div>
+        <div class="metric">
+          <strong>2 套模型实现</strong>
+          <span><code>hf_models/</code> 用于训练，<code>inference_model/</code> 用于 TTT-aware 推理。</span>
+        </div>
+        <div class="metric">
+          <strong>1 个算法落点</strong>
+          <span>选中层的 MLP <code>down_proj</code>，即论文里的 <code>W_down</code>。</span>
+        </div>
+      </div>
+
+      <div class="file-grid">
+        <div class="file-card">
+          <h3>训练链路</h3>
+          <ul>
+            <li><code>train.sh</code>：封装 <code>torchrun</code>，自动选择 GPU/NPU 并注入分布式参数。</li>
+            <li><code>tasks/train_torch.py</code>：强制 HuggingFace backend，提前导入 <code>hf_models</code> 注册自定义模型，再调用 VeOmni 构建模型、数据和优化器。</li>
+            <li><code>configs/pretrain/*.yaml</code>：把 <code>ttt_layers</code>、<code>ttt_mode</code>、<code>ttt_lr</code>、<code>ttt_chunk</code> 注入模型配置。</li>
+          </ul>
+        </div>
+        <div class="file-card">
+          <h3>推理与评测链路</h3>
+          <ul>
+            <li><code>inference_model/</code>：注册推理版 Qwen3/LLaMA，并引入 <code>TTTDynamicCache</code> 保存 fast weight 状态。</li>
+            <li><code>eval.sh</code> 与 <code>eval_config/</code>：通过 OpenCompass 跑 RULER 长上下文评测。</li>
+            <li><code>scripts/merge_dcp_to_hf.py</code>：把 VeOmni DCP checkpoint 转成 HuggingFace 格式。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="algorithm">
+      <h2>论文算法主线</h2>
+      <div class="architecture">
+        <div>
+          <p>
+            论文的核心判断是：不要替换 Attention，也不要加独立外部记忆，而是复用 Transformer MLP。
+            gated MLP 的 <code>W_gate</code> 和 <code>W_up</code> 继续作为慢权重，<code>W_down</code> 被视为 fast weights，
+            在推理时随输入 chunk 更新。
+          </p>
+          <div class="formula">Z = act(H · W_gate^T) ⊙ (H · W_up^T)</div>
+          <div class="formula">O_i = Z_i · (W_down^(i))^T</div>
+          <div class="formula">W_down^(i+1) = W_down^(i) + η · V_i^T · Z_i</div>
+          <p>
+            其中 <code>V</code> 不是传统 TTT 的当前 token 重构目标，而是由输入 embedding 或隐藏状态经 Conv1D 和投影得到的
+            LM-aligned target，目标是让 fast weights 存储对未来 token 预测有用的信息。
+          </p>
+        </div>
+        <div class="diagram" aria-label="Chunk-wise apply then update SVG">
+          <svg viewBox="0 0 780 390" role="img">
+            <defs>
+              <marker id="arrow2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+                <path d="M0,0 L12,6 L0,12 z" fill="#334155"></path>
+              </marker>
+            </defs>
+            <rect x="0" y="0" width="780" height="390" fill="#fbfdff"></rect>
+            <text x="26" y="42" font-size="22" font-weight="800" fill="#172033">Chunk-wise Apply-Then-Update</text>
+            <text x="26" y="70" font-size="13" fill="#647084">每个 chunk 先使用当前 W_down 计算输出，再用该 chunk 产生 ΔW，更新给后续 chunk 使用。</text>
+
+            <g transform="translate(28,112)">
+              <rect width="130" height="76" rx="8" fill="#e8f0ff" stroke="#9fb2d6"></rect>
+              <text x="25" y="31" font-size="14" font-weight="800" fill="#172033">Chunk 0</text>
+              <text x="19" y="56" font-size="12" fill="#334155">用 W_down^0</text>
+            </g>
+            <g transform="translate(208,112)">
+              <rect width="130" height="76" rx="8" fill="#e7f7f2" stroke="#86c8b7"></rect>
+              <text x="25" y="31" font-size="14" font-weight="800" fill="#172033">Chunk 1</text>
+              <text x="19" y="56" font-size="12" fill="#334155">用 W_down^1</text>
+            </g>
+            <g transform="translate(388,112)">
+              <rect width="130" height="76" rx="8" fill="#fff4da" stroke="#d7ae55"></rect>
+              <text x="25" y="31" font-size="14" font-weight="800" fill="#172033">Chunk 2</text>
+              <text x="19" y="56" font-size="12" fill="#334155">用 W_down^2</text>
+            </g>
+            <g transform="translate(568,112)">
+              <rect width="130" height="76" rx="8" fill="#f2ebff" stroke="#b89df5"></rect>
+              <text x="25" y="31" font-size="14" font-weight="800" fill="#172033">Chunk 3</text>
+              <text x="19" y="56" font-size="12" fill="#334155">用 W_down^3</text>
+            </g>
+
+            <line x1="158" y1="150" x2="207" y2="150" stroke="#334155" stroke-width="2" marker-end="url(#arrow2)"></line>
+            <line x1="338" y1="150" x2="387" y2="150" stroke="#334155" stroke-width="2" marker-end="url(#arrow2)"></line>
+            <line x1="518" y1="150" x2="567" y2="150" stroke="#334155" stroke-width="2" marker-end="url(#arrow2)"></line>
+
+            <g transform="translate(72,230)">
+              <rect width="88" height="42" rx="7" fill="#fff" stroke="#d8dee9"></rect>
+              <text x="14" y="27" font-size="13" fill="#334155">ΔW_0</text>
+            </g>
+            <g transform="translate(252,230)">
+              <rect width="88" height="42" rx="7" fill="#fff" stroke="#d8dee9"></rect>
+              <text x="14" y="27" font-size="13" fill="#334155">ΔW_1</text>
+            </g>
+            <g transform="translate(432,230)">
+              <rect width="88" height="42" rx="7" fill="#fff" stroke="#d8dee9"></rect>
+              <text x="14" y="27" font-size="13" fill="#334155">ΔW_2</text>
+            </g>
+
+            <path d="M116 230 C120 206, 164 194, 208 180" fill="none" stroke="#0f8f75" stroke-width="2.5" marker-end="url(#arrow2)"></path>
+            <path d="M296 230 C300 206, 344 194, 388 180" fill="none" stroke="#0f8f75" stroke-width="2.5" marker-end="url(#arrow2)"></path>
+            <path d="M476 230 C480 206, 524 194, 568 180" fill="none" stroke="#0f8f75" stroke-width="2.5" marker-end="url(#arrow2)"></path>
+
+            <rect x="80" y="316" width="590" height="38" rx="8" fill="#eef2f7"></rect>
+            <text x="106" y="341" font-size="13" fill="#334155">Context Parallel 版本：先并行算 ΔW_i，再做 prefix-sum，最后并行算每个 chunk 的有效 W_down。</text>
+          </svg>
+        </div>
+      </div>
+
+      <h3>论文到实现的对应关系</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>论文概念</th>
+            <th>代码实现</th>
+            <th>含义</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>W_down</code> fast weights</td>
+            <td><code>self.down_proj.weight</code></td>
+            <td>MLP 最终投影矩阵被复用为可在线更新的状态。</td>
+          </tr>
+          <tr>
+            <td><code>Z</code> key / intermediate activation</td>
+            <td><code>h = act(gate_proj(x)) * up_proj(x)</code></td>
+            <td>SwiGLU 中间激活，作为更新里的 key。</td>
+          </tr>
+          <tr>
+            <td><code>V_hat = Conv1D(X0) W_target</code></td>
+            <td><code>ttt_conv</code> + <code>ttt_proj</code></td>
+            <td>生成语言建模对齐的 value target。</td>
+          </tr>
+          <tr>
+            <td>Chunk-wise update</td>
+            <td><code>padding()</code>、<code>rearrange()</code>、<code>cumsum()</code></td>
+            <td>训练时一次性并行计算 chunk 前缀更新；推理时保存跨步状态。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="implementation">
+      <h2>in-place-ttt 的关键算法改动在哪里</h2>
+      <p>
+        最关键的算法改动集中在四类文件：训练模型、推理模型、配置、模型注册/入口。真正改变数学行为的是
+        <code>modeling_*.py</code> 里的 MLP 和 decoder layer；训练循环只是把这些模型接入 VeOmni。
+      </p>
+
+      <div class="code-map">
+        <div class="label train">训练模型</div>
+        <div class="content">
+          <code>hf_models/hf_qwen3/modeling_qwen3.py:72-138</code> 和
+          <code>hf_models/hf_llama/modeling_llama.py:153-232</code>。
+          这里给 MLP 增加 <code>layer_idx</code>、<code>ttt_conv</code>、<code>ttt_proj</code>、<code>ttt_lr</code>、<code>ttt_chunk</code>，
+          并在 <code>forward(x, t)</code> 中按 chunk 计算 <code>d_down_proj</code> 和前缀累积的有效 <code>down_proj</code>。
+        </div>
+
+        <div class="label train">训练层间传参</div>
+        <div class="content">
+          <code>hf_models/hf_qwen3/modeling_qwen3.py:288-337</code> 和
+          <code>hf_models/hf_qwen3/modeling_qwen3.py:475-550</code>。
+          decoder layer 判断当前层是否是 TTT layer；<code>ttt_target=hidden_states</code> 时默认用 MLP 前的 hidden states，
+          <code>ttt_target=input_embed</code> 时由模型级方法传入输入 embedding。
+        </div>
+
+        <div class="label infer">推理状态</div>
+        <div class="content">
+          <code>inference_model/hf_qwen3/modeling_qwen3.py:52-59</code> 定义 <code>TTTDynamicCache</code>，
+          <code>inference_model/hf_qwen3/modeling_qwen3.py:117-152</code> 让 MLP 接收 <code>past_w</code> 并返回更新后的权重，
+          <code>inference_model/hf_qwen3/modeling_qwen3.py:353-376</code> 保存未满 chunk 的 <code>past_h/past_t</code> 和 <code>present_w</code>。
+        </div>
+
+        <div class="label infer">生成约束</div>
+        <div class="content">
+          <code>inference_model/hf_qwen3/modeling_qwen3.py:575-587</code> 和 LLaMA 对应实现会在 TTT 模式下强制使用
+          <code>TTTDynamicCache</code>，并限制生成 batch size 为 1。这是为了让在线 fast weight 状态在自回归生成中语义清晰。
+        </div>
+
+        <div class="label config">配置开关</div>
+        <div class="content">
+          <code>configuration_qwen3.py</code> / <code>configuration_llama.py</code> 新增
+          <code>ttt_layers</code>、<code>ttt_mode</code>、<code>ttt_proj</code>、<code>ttt_lr</code>、<code>ttt_chunk</code>、<code>ttt_target</code>。
+          推荐训练配置在 <code>configs/pretrain/qwen3_longct.yaml:15-22</code> 和
+          <code>configs/pretrain/llama3_longct.yaml:15-22</code>。
+        </div>
+
+        <div class="label ops">入口与注册</div>
+        <div class="content">
+          <code>tasks/train_torch.py:27-36</code> 先导入 <code>hf_models</code> 覆盖 AutoModel 注册；
+          <code>hf_models/*/__init__.py</code> 注册自定义配置和模型；
+          <code>inference_model/*/__init__.py</code> 注册推理版模型。
+        </div>
+      </div>
+
+      <div class="findings">
+        <div class="finding">
+          <span class="tag tag-blue">核心一</span>
+          <h3>MLP 内部复用 fast weights</h3>
+          <p>
+            标准 MLP 原本只做 <code>down_proj(h)</code>；TTT layer 中改为先根据 chunk 前缀更新得到有效权重，
+            再用这个有效权重投影当前 chunk。
+          </p>
+        </div>
+        <div class="finding">
+          <span class="tag tag-green">核心二</span>
+          <h3>LM-aligned target</h3>
+          <p>
+            <code>ttt_conv</code> 是 depthwise Conv1D，<code>ttt_proj</code> 是 hidden-size 方阵投影；
+            两者共同对应论文中的 <code>Conv1D(X0) W_target</code>。
+          </p>
+        </div>
+        <div class="finding">
+          <span class="tag tag-amber">核心三</span>
+          <h3>训练与推理分离实现</h3>
+          <p>
+            训练版用 <code>cumsum</code> 批量形成 chunk 前缀；推理版显式循环并把 <code>past_w</code>、未满 chunk 的尾部状态放进 cache。
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="workflow">
+      <h2>端到端工作流</h2>
+      <div class="flow">
+        <div class="flow-step">
+          <b>1. 数据</b>
+          <span>提供 VeOmni 兼容的 processed dataset，常用 <code>plaintext</code> 和 <code>content_split</code>。</span>
+        </div>
+        <div class="flow-step">
+          <b>2. 构建模型</b>
+          <span><code>build_foundation_model(..., config_kwargs=args.model.foundation)</code> 注入 TTT 参数。</span>
+        </div>
+        <div class="flow-step">
+          <b>3. 训练</b>
+          <span>VeOmni/FSDP2 训练；forward 中的 TTT MLP 参与反向传播，学习 <code>ttt_conv</code> 和 <code>ttt_proj</code>。</span>
+        </div>
+        <div class="flow-step">
+          <b>4. 转换</b>
+          <span><code>merge_dcp_to_hf.py</code> 将 DCP 权重按 shard 输出为 HuggingFace checkpoint。</span>
+        </div>
+        <div class="flow-step">
+          <b>5. 推理评测</b>
+          <span><code>inference_model</code> 注册 TTT cache；<code>eval.sh</code> 跑 RULER sweep。</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="notes">
+      <h2>阅读结论与注意点</h2>
+      <ul class="checklist">
+        <li>
+          <strong>算法关键点非常集中：</strong>优先读 <code>hf_models/hf_qwen3/modeling_qwen3.py</code> 的 <code>Qwen3MLP</code>，
+          再读推理版 <code>inference_model/hf_qwen3/modeling_qwen3.py</code> 的 cache 处理。LLaMA 版本基本是同构移植。
+        </li>
+        <li>
+          <strong>论文与代码映射清晰：</strong>论文的 <code>W_down</code>、<code>Z</code>、<code>V_hat</code>、chunk update
+          都能在 MLP forward 中直接找到对应实现。
+        </li>
+        <li>
+          <strong>配置决定启用范围：</strong><code>ttt_layers</code> 控制哪些层启用，推荐配置是每隔 6 层启用一次；
+          <code>ttt_chunk</code> 控制更新粒度，README 推荐值为 4096，配置类默认值为 8192。
+        </li>
+        <li>
+          <strong>推理版有状态语义：</strong>生成过程中 fast weights 会随上下文持续变化，所以实现用自定义 cache 保存
+          <code>past_h</code>、<code>past_t</code>、<code>past_w</code>，且当前只支持 batch size 1 的 TTT generation。
+        </li>
+        <li>
+          <strong>需要复核的工程边界：</strong>论文附录提到长上下文评测时有 update delta clipping，但当前仓库的
+          <code>inference_model/</code> 中没有明显的 clipping 实现；如果复现实验，需要确认 checkpoint/config 或外部推理栈是否另行处理。
+        </li>
+      </ul>
+
+      <div class="note">
+        <strong>实现细节提示：</strong>
+        代码中 <code>ttt_conv</code> 使用 <code>kernel_size=5, padding=2, groups=hidden_size</code>。
+        由于当前 chunk 的更新不会用于当前 chunk 的输出，而是用于后续 chunk，这保持了 chunk 级 apply-then-update 语义。
+        如果要讨论严格逐 token 因果，需要单独审查 Conv1D padding 与目标构造策略。
+      </div>
+
+      <h3>关键参考位置</h3>
+      <div class="refs">
+        <div class="ref">
+          <strong>论文方法：</strong><br>
+          <code>papers/sections/approach.tex:10-47</code>，MLP 复用、chunk update、LM-aligned objective。
+        </div>
+        <div class="ref">
+          <strong>并行算法：</strong><br>
+          <code>papers/sections/appendix.tex:89-114</code>，Context Parallel pseudocode。
+        </div>
+        <div class="ref">
+          <strong>训练实现：</strong><br>
+          <code>hf_models/hf_qwen3/modeling_qwen3.py:72-138</code>，训练版 TTT MLP。
+        </div>
+        <div class="ref">
+          <strong>推理实现：</strong><br>
+          <code>inference_model/hf_qwen3/modeling_qwen3.py:52-152</code>，TTT cache 与在线权重更新。
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

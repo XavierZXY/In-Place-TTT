@@ -16,7 +16,7 @@ from opencompass.models import HuggingFaceBaseModel
 from opencompass.utils.text_postprocessors import extract_non_reasoning_content
 
 _model_configs = [
-    ("your_model", "/path/to/your_hf_model"),
+    ("qwen3-4b", "/zouxiangyu/models/Qwen/Qwen3-4B"),
     # (model_name,path)
 ]
 

@@ -19,6 +19,7 @@ set -o pipefail
 
 export TOKENIZERS_PARALLELISM=false
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export WANDB_BASE_URL=${WANDB_BASE_URL:=https://wandb.glm.ai}
 
 NNODES=${NNODES:=1}
 if command -v nvidia-smi &> /dev/null && nvidia-smi --list-gpus &> /dev/null; then

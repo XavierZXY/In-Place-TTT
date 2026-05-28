@@ -20,37 +20,38 @@ model:
     ttt_mode: true
     ttt_proj: true
     ttt_lr: 3
-    ttt_chunk: 4096
+    ttt_chunk: 128
 
 data:
-  train_path: /path/to/your_data
-  train_size: 20000000000
+  train_path: data/smoke/plaintext.jsonl
+  train_size: 128
   dataloader_type: native
-  datasets_type: iterable
+  datasets_type: mapping
   data_type: plaintext
-  max_seq_len: 65536
+  max_seq_len: 128
   text_keys: content_split
   drop_last: true
+  num_workers: 0
 
 train:
-  output_dir: outputs/qwen3-4b-longct
+  output_dir: outputs/qwen3-4b-smoke
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
-  global_batch_size: 64
+  global_batch_size: 1
   micro_batch_size: 1
   rmpad: false
-  use_wandb: true
+  use_wandb: false
   wandb_project: in-place-ttt
-  wandb_name: qwen3-4b-longct
-  max_steps: 5000
+  wandb_name: qwen3-4b-smoke
+  max_steps: 1
   rmpad_with_pos_ids: false
   dyn_bsz_margin: 0
   dyn_bsz: false
   optimizer: adamw
   lr: 5.0e-6
-  lr_warmup_ratio: 0.02
-  lr_decay_style: cosine
-  lr_decay_ratio: 0.90
+  lr_warmup_ratio: 0.0
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
   weight_decay: 0.1
   max_grad_norm: 1.0
   enable_mixed_precision: true
@@ -58,5 +59,6 @@ train:
   enable_full_shard: true
   init_device: meta
   ckpt_manager: dcp
-  save_steps: 500
-  save_hf_weights: true
+  save_steps: 0
+  save_epochs: 0
+  save_hf_weights: false

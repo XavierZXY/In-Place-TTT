@@ -169,3 +169,8 @@ tmp
 models
 gpu.py
 vscode.sh
+
+papers/
+data/
+outputs/
+logs/

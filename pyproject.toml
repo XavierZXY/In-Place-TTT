@@ -7,8 +7,8 @@ build-backend = "setuptools.build_meta"
 "Source Code" = "https://github.com/ByteDance-Seed/VeOmni"
 
 [project]
-name = "veomni"
-dynamic = ["version"]
+name = "in-place-ttt"
+version = "0.1.0"
 description = "VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework"
 readme = "README.md"
 requires-python = ">=3.11, <3.12"
@@ -30,6 +30,9 @@ dependencies = [
   "wandb",
   "setuptools",
   "einops>=0.8.1",
+  "opt_einsum",
+  "opencompass",
+  "veomni @ git+https://github.com/ByteDance-Seed/VeOmni.git@9b91e164bea9e17f17ed490aab5e076c2335ca25",
 ]
 
 [project.optional-dependencies]
@@ -177,9 +180,6 @@ requires-dist = ["torch"]
 [[tool.uv.dependency-metadata]]
 name = "flash-attn-3"
 requires-dist = ["torch"]
-
-[tool.setuptools.dynamic]
-version = {attr = "veomni.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]

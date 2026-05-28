@@ -20,29 +20,33 @@ model:
     ttt_mode: true
     ttt_proj: true
     ttt_lr: 3
-    ttt_chunk: 4096
+    ttt_chunk: 1024
 
 data:
-  train_path: /path/to/your_data
+  train_path: data/code_32k_20b/train_plaintext.jsonl
+  eval_path: data/code_32k_20b/eval_plaintext.jsonl
+  eval_datasets_type: mapping
   train_size: 20000000000
   dataloader_type: native
   datasets_type: iterable
   data_type: plaintext
-  max_seq_len: 65536
+  max_seq_len: 32768
   text_keys: content_split
   drop_last: true
 
 train:
-  output_dir: outputs/qwen3-4b-longct
+  output_dir: outputs/qwen3-4b-code-32k
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
-  global_batch_size: 64
+  global_batch_size: 128
   micro_batch_size: 1
   rmpad: false
   use_wandb: true
   wandb_project: in-place-ttt
-  wandb_name: qwen3-4b-longct
+  wandb_name: qwen3-4b-code-32k
   max_steps: 5000
+  eval_steps: 500
+  eval_batches: 8
   rmpad_with_pos_ids: false
   dyn_bsz_margin: 0
   dyn_bsz: false
@@ -58,5 +62,5 @@ train:
   enable_full_shard: true
   init_device: meta
   ckpt_manager: dcp
-  save_steps: 500
+  save_steps: 1000
   save_hf_weights: true
