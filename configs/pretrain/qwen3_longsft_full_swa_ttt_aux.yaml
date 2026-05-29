@@ -1,0 +1,59 @@
+# SWA(1024) + In-Place TTT + JEPA-style aux loss on V-hat.
+# This mirrors the v0 24k amp setup and is launched by
+# scripts/train/longsft/run_full_swa_ttt_aux.sh.
+
+model:
+  model_path: /zouxiangyu/models/Qwen/Qwen3-4B
+  tokenizer_path: /zouxiangyu/models/Qwen/Qwen3-4B
+  foundation:
+    max_position_embeddings: 131072
+    rope_theta: 5000000.0
+    ttt_layers: [0, 6, 12, 18, 24, 30]
+    ttt_mode: true
+    ttt_proj: true
+    ttt_lr: 5
+    ttt_chunk: 256
+    ttt_target: input_embed
+    ttt_compress_window: 1024
+    ttt_aux_loss_weight: 0.1
+
+data:
+  train_path: /zouxiangyu/data_ttt/long-sft/train.jsonl
+  eval_path: /zouxiangyu/data_ttt/long-sft/val.jsonl
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 24576
+  text_keys: messages
+  drop_last: true
+
+train:
+  output_dir: /zouxiangyu/codes/Learning/In-Place-TTT/outputs/longsft-swa-ttt-aux-amp
+  load_checkpoint_path: "auto"
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  global_batch_size: 32
+  micro_batch_size: 1
+  rmpad: false
+  use_wandb: true
+  max_steps: 4000
+  rmpad_with_pos_ids: false
+  dyn_bsz_margin: 0
+  dyn_bsz: false
+  optimizer: adamw
+  lr: 1.0e-5
+  lr_warmup_ratio: 0.05
+  lr_decay_style: cosine
+  lr_decay_ratio: 0.90
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  init_device: meta
+  ckpt_manager: dcp
+  save_steps: 1000
+  eval_steps: 100
+  eval_batches: 500
+  save_hf_weights: false

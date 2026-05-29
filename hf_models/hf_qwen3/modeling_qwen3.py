@@ -40,12 +40,20 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import check_model_inputs
+from transformers.utils.generic import check_model_inputs as _check_model_inputs
+from in_place_ttt.transformers_compat import resolve_check_model_inputs
 from .configuration_qwen3 import Qwen3Config
 
 # TTT: additional imports
 from einops import rearrange, repeat
-from opt_einsum import contract
+from in_place_ttt.ttt_aux.loss import compute_ttt_aux_loss
+
+try:
+    from opt_einsum import contract
+except ModuleNotFoundError:
+    contract = torch.einsum
+
+check_model_inputs = resolve_check_model_inputs(_check_model_inputs)
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -104,6 +112,24 @@ class Qwen3MLP(nn.Module):
             )
             x = torch.cat([x, padding_embeddings], dim=1)
         return rearrange(x, "b (t c) d -> b t c d", c=self.ttt_chunk)
+
+    def compute_v_hat_for_aux(self, inputs_embeds: torch.Tensor) -> Optional[torch.Tensor]:
+        if not hasattr(self, "ttt_conv"):
+            return None
+
+        seq_len = inputs_embeds.shape[1]
+        t_padded = self.padding(inputs_embeds)
+        bs, chunk_num, chunk_size, _ = t_padded.shape
+        t_conv = (
+            self.ttt_conv(t_padded.transpose(-1, -2).reshape(bs * chunk_num, -1, chunk_size))
+            .transpose(-1, -2)
+            .reshape(bs, chunk_num, chunk_size, -1)
+        )
+        if self.ttt_proj is not None:
+            v_hat = contract("b t c d, d e -> b t c e", t_conv, self.ttt_proj.weight)
+        else:
+            v_hat = t_conv
+        return rearrange(v_hat, "b t c d -> b (t c) d")[:, :seq_len, :]
 
     def forward(self, x, t: Optional[torch.Tensor] = None):  # TTT: added t param
         h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
@@ -310,8 +336,12 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         target_states: Optional[torch.Tensor] = None,
+        ttt_aux_only: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        if ttt_aux_only:
+            return self.mlp.compute_v_hat_for_aux(hidden_states)
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -453,6 +483,16 @@ class Qwen3RotaryEmbedding(nn.Module):
 @auto_docstring
 class Qwen3Model(Qwen3PreTrainedModel):
     def __init__(self, config: Qwen3Config):
+        ttt_compress_window = getattr(config, "ttt_compress_window", 0)
+        if ttt_compress_window > 0:
+            config.use_sliding_window = True
+            config.sliding_window = ttt_compress_window
+            full_attn_idx = set(getattr(config, "full_attention_layers", []) or [])
+            config.layer_types = [
+                "full_attention" if i in full_attn_idx else "sliding_attention"
+                for i in range(config.num_hidden_layers)
+            ]
+
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -483,7 +523,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             return inputs_embeds
         return None
 
-    @check_model_inputs()
+    @check_model_inputs
     @auto_docstring
     def forward(
         self,
@@ -552,10 +592,45 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
 
         hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(
+        ttt_aux_loss_weight = float(getattr(self.config, "ttt_aux_loss_weight", 0.0))
+        ttt_aux_loss = None
+        if self.training and ttt_aux_loss_weight > 0.0 and self.ttt_mode and self.ttt_target == "input_embed":
+            seq_len = inputs_embeds.shape[1]
+            if seq_len > 1:
+                emb_for_aux = inputs_embeds.detach()
+                target = emb_for_aux[:, 1:, :]
+                predictions = []
+                targets = []
+                for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+                    if not decoder_layer.is_ttt_layer:
+                        continue
+                    saved_ckpt = getattr(decoder_layer, "gradient_checkpointing", False)
+                    decoder_layer.gradient_checkpointing = False
+                    try:
+                        v_hat = decoder_layer(emb_for_aux, ttt_aux_only=True)
+                    finally:
+                        decoder_layer.gradient_checkpointing = saved_ckpt
+                    if v_hat is None:
+                        continue
+                    predictions.append(v_hat[:, : seq_len - 1, :])
+                    targets.append(target)
+                if predictions:
+                    ttt_aux_loss = compute_ttt_aux_loss(
+                        predictions,
+                        targets,
+                        loss_type=getattr(self.config, "ttt_aux_loss_type", "jepa"),
+                        loss_exp=float(getattr(self.config, "ttt_jepa_loss_exp", 1.0)),
+                        reg_coeff=float(getattr(self.config, "ttt_jepa_reg_coeff", 0.0)),
+                        reg_eps=float(getattr(self.config, "ttt_jepa_reg_eps", 0.0001)),
+                    )
+
+        out = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
         )
+        out.ttt_aux_loss = ttt_aux_loss
+        self._last_ttt_aux_loss = ttt_aux_loss
+        return out
 
 
 @auto_docstring
@@ -630,13 +705,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
+        out = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+        out.ttt_aux_loss = getattr(outputs, "ttt_aux_loss", None)
+        return out
 
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):

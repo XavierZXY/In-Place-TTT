@@ -14,11 +14,25 @@
 
 from .configuration_qwen3 import Qwen3Config
 from .modeling_qwen3 import Qwen3Model, Qwen3ForCausalLM
-from liger_kernel.transformers.model.qwen3 import lce_forward as qwen3_lce_forward
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+try:
+    from liger_kernel.transformers.model.qwen3 import lce_forward as qwen3_lce_forward
+except ModuleNotFoundError:
+    qwen3_lce_forward = None
 
 AutoConfig.register("qwen3", Qwen3Config, exist_ok=True)
 AutoModel.register(Qwen3Config, Qwen3Model, exist_ok=True)
 AutoModelForCausalLM.register(Qwen3Config, Qwen3ForCausalLM, exist_ok=True)
 
-Qwen3ForCausalLM.forward = qwen3_lce_forward
+
+def _qwen3_lce_forward_with_ttt_aux(self, *args, **kwargs):
+    out = qwen3_lce_forward(self, *args, **kwargs)
+    aux = getattr(self.model, "_last_ttt_aux_loss", None)
+    if hasattr(out, "__dict__"):
+        out.ttt_aux_loss = aux
+    return out
+
+
+if qwen3_lce_forward is not None:
+    Qwen3ForCausalLM.forward = _qwen3_lce_forward_with_ttt_aux

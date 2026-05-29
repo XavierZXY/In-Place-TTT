@@ -47,10 +47,17 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import check_model_inputs
+from transformers.utils.generic import check_model_inputs as _check_model_inputs
+from in_place_ttt.transformers_compat import resolve_check_model_inputs
 from einops import rearrange
-from opt_einsum import contract
+try:
+    from opt_einsum import contract
+except ModuleNotFoundError:
+    contract = torch.einsum
 from .configuration_llama import LlamaConfig
+
+
+check_model_inputs = resolve_check_model_inputs(_check_model_inputs)
 
 
 class TTTDynamicCache(DynamicCache):
@@ -486,7 +493,7 @@ class LlamaModel(LlamaPreTrainedModel):
             return inputs_embeds
         return None
 
-    @check_model_inputs()
+    @check_model_inputs
     @auto_docstring
     def forward(
         self,

@@ -180,6 +180,7 @@ class Qwen3Config(PretrainedConfig):
         max_window_layers=28,
         layer_types=None,
         attention_dropout=0.0,
+        full_attention_layers=None,
         # TTT-related parameters
         ttt_layers=[0, 6, 12, 18, 24, 30],
         ttt_mode=True,
@@ -187,6 +188,12 @@ class Qwen3Config(PretrainedConfig):
         ttt_lr=0.3,
         ttt_chunk=8192,
         ttt_target="hidden_states",
+        ttt_compress_window=0,
+        ttt_aux_loss_weight=0.0,
+        ttt_aux_loss_type="jepa",
+        ttt_jepa_loss_exp=1.0,
+        ttt_jepa_reg_coeff=0.0,
+        ttt_jepa_reg_eps=0.0001,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -228,6 +235,12 @@ class Qwen3Config(PretrainedConfig):
                 for i in range(self.num_hidden_layers)
             ]
         layer_type_validation(self.layer_types, self.num_hidden_layers)
+        self.full_attention_layers = list(full_attention_layers) if full_attention_layers else []
+        for i in self.full_attention_layers:
+            if not (0 <= i < self.num_hidden_layers):
+                raise ValueError(
+                    f"full_attention_layers contains index {i} out of range [0, {self.num_hidden_layers})"
+                )
 
         # TTT settings
         self.ttt_layers = ttt_layers
@@ -238,6 +251,25 @@ class Qwen3Config(PretrainedConfig):
         self.ttt_target = ttt_target
         if self.ttt_target not in {"hidden_states", "input_embed"}:
             raise ValueError("ttt_target must be one of {'hidden_states', 'input_embed'}")
+        self.ttt_compress_window = ttt_compress_window
+        self.ttt_aux_loss_weight = float(ttt_aux_loss_weight)
+        if self.ttt_aux_loss_weight < 0:
+            raise ValueError(f"ttt_aux_loss_weight must be >= 0, got {self.ttt_aux_loss_weight}")
+        self.ttt_aux_loss_type = str(ttt_aux_loss_type)
+        if self.ttt_aux_loss_type not in {"jepa", "cosine"}:
+            raise ValueError(
+                "ttt_aux_loss_type must be one of {'jepa', 'cosine'}, got "
+                f"{self.ttt_aux_loss_type!r}"
+            )
+        self.ttt_jepa_loss_exp = float(ttt_jepa_loss_exp)
+        if self.ttt_jepa_loss_exp <= 0:
+            raise ValueError(f"ttt_jepa_loss_exp must be > 0, got {self.ttt_jepa_loss_exp}")
+        self.ttt_jepa_reg_coeff = float(ttt_jepa_reg_coeff)
+        if self.ttt_jepa_reg_coeff < 0:
+            raise ValueError(f"ttt_jepa_reg_coeff must be >= 0, got {self.ttt_jepa_reg_coeff}")
+        self.ttt_jepa_reg_eps = float(ttt_jepa_reg_eps)
+        if self.ttt_jepa_reg_eps < 0:
+            raise ValueError(f"ttt_jepa_reg_eps must be >= 0, got {self.ttt_jepa_reg_eps}")
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,

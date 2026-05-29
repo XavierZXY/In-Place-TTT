@@ -14,11 +14,16 @@
 
 from .configuration_llama import LlamaConfig
 from .modeling_llama import LlamaModel, LlamaForCausalLM
-from liger_kernel.transformers.model.llama import lce_forward as llama_lce_forward
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+try:
+    from liger_kernel.transformers.model.llama import lce_forward as llama_lce_forward
+except ModuleNotFoundError:
+    llama_lce_forward = None
 
 AutoConfig.register("llama", LlamaConfig, exist_ok=True)
 AutoModel.register(LlamaConfig, LlamaModel, exist_ok=True)
 AutoModelForCausalLM.register(LlamaConfig, LlamaForCausalLM, exist_ok=True)
 
-LlamaForCausalLM.forward = llama_lce_forward
+if llama_lce_forward is not None:
+    LlamaForCausalLM.forward = llama_lce_forward

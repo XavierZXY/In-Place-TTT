@@ -40,13 +40,20 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import check_model_inputs
+from transformers.utils.generic import check_model_inputs as _check_model_inputs
+from in_place_ttt.transformers_compat import resolve_check_model_inputs
 
 # TTT: additional imports
 from einops import rearrange
-from opt_einsum import contract
+try:
+    from opt_einsum import contract
+except ModuleNotFoundError:
+    contract = torch.einsum
 
 from .configuration_qwen3 import Qwen3Config
+
+
+check_model_inputs = resolve_check_model_inputs(_check_model_inputs)
 
 
 # TTT: cache that persists partial chunk states and adapted weights across generation steps
@@ -482,7 +489,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             return inputs_embeds
         return None
 
-    @check_model_inputs()
+    @check_model_inputs
     @auto_docstring
     def forward(
         self,

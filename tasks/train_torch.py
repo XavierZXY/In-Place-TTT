@@ -37,6 +37,10 @@ from tqdm import trange
 
 # Import custom TTT models (must be before veomni imports to override AutoModel registration)
 import hf_models  # noqa: F401
+from in_place_ttt.ttt_aux.training import (
+    accumulate_ttt_aux_grads as _accumulate_ttt_aux_grads,
+    get_last_ttt_aux_loss as _get_last_ttt_aux_loss,
+)
 
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
@@ -517,11 +521,18 @@ def main():
                 loss: "torch.Tensor" = (
                     model_outputs.loss * length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
                 )
+                loss_scale = length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
 
                 with model_bwd_context:
                     loss.backward()
+                    scaled_aux_loss = _accumulate_ttt_aux_grads(
+                        model,
+                        _get_last_ttt_aux_loss(model_outputs, model),
+                        float(getattr(model_config, "ttt_aux_loss_weight", 0.0)),
+                        loss_scale,
+                    )
 
-                total_loss += loss.item()
+                total_loss += loss.item() + (scaled_aux_loss.item() if scaled_aux_loss is not None else 0.0)
                 del micro_batch
 
             grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
