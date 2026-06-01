@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RULER 结果对比</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>RULER 结果对比</h1>
+          <p id="dataSubtitle">正在加载 summary_all_lengths.json</p>
+        </div>
+        <div class="topbar-actions">
+          <label class="switch">
+            <input id="autoRefreshToggle" type="checkbox" />
+            <span>自动刷新</span>
+          </label>
+          <button id="refreshButton" class="primary-button" type="button">刷新数据</button>
+        </div>
+      </header>
+
+      <section id="statusBanner" class="status-banner" hidden></section>
+
+      <section class="summary-strip" aria-label="数据概览">
+        <div class="summary-item">
+          <span>结果目录</span>
+          <strong id="resultCount">0</strong>
+        </div>
+        <div class="summary-item">
+          <span>上下文长度</span>
+          <strong id="lengthCount">0</strong>
+        </div>
+        <div class="summary-item">
+          <span>评测任务</span>
+          <strong id="taskCount">0</strong>
+        </div>
+        <div class="summary-item">
+          <span>最近扫描</span>
+          <strong id="lastScan">-</strong>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <aside class="filters" aria-label="筛选器">
+          <div class="filter-block">
+            <label for="viewPreset">结果视图</label>
+            <select id="viewPreset">
+              <option value="base">Base: 无 chat template，排除 smoke</option>
+              <option value="all">全部结果</option>
+              <option value="chat">Chat template</option>
+              <option value="smoke">Smoke</option>
+            </select>
+          </div>
+
+          <div class="filter-grid">
+            <div class="filter-block">
+              <label for="metricSelect">指标</label>
+              <select id="metricSelect"></select>
+            </div>
+            <div class="filter-block">
+              <label for="lengthSelect">固定长度</label>
+              <select id="lengthSelect"></select>
+            </div>
+          </div>
+
+          <div class="filter-block">
+            <label for="modelSearch">模型筛选</label>
+            <input id="modelSearch" type="search" placeholder="输入目录名片段" />
+          </div>
+
+          <div class="model-toolbar">
+            <button id="selectVisibleButton" type="button">选择可见</button>
+            <button id="clearModelsButton" type="button">清空</button>
+          </div>
+
+          <div id="modelList" class="model-list" aria-label="模型列表"></div>
+        </aside>
+
+        <section class="dashboard">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>同长度模型对比</h2>
+                <p id="lengthCompareHint">选择一个上下文长度后，对比不同模型的同一指标。</p>
+              </div>
+              <span id="bestAtLength" class="metric-pill">-</span>
+            </div>
+            <div id="barChart" class="bar-chart"></div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>排名</th>
+                    <th>模型</th>
+                    <th>分数</th>
+                    <th>样本数</th>
+                    <th>耗时</th>
+                  </tr>
+                </thead>
+                <tbody id="rankingBody"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>模型随长度变化</h2>
+                <p>同一模型在不同上下文长度下的趋势，用于观察长上下文退化或恢复。</p>
+              </div>
+            </div>
+            <div id="lineChart" class="line-chart"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>任务矩阵</h2>
+                <p id="taskMatrixHint">固定长度下，逐任务查看模型差异。</p>
+              </div>
+            </div>
+            <div id="taskHeatmap" class="heatmap-wrap"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>长度矩阵</h2>
+                <p>所选指标在模型和上下文长度两个维度上的完整视图。</p>
+              </div>
+            </div>
+            <div id="lengthHeatmap" class="heatmap-wrap"></div>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
