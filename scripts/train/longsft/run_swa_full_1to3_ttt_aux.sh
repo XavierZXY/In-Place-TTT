@@ -1,12 +1,12 @@
 #!/bin/bash
-# SWA(1024) + In-Place TTT + JEPA-style aux loss alpha=0.1.
+# Full:SWA attention = 1:3 hybrid + In-Place TTT on SWA layers only.
 
 set -x
 set -o pipefail
 
-CONFIG="configs/pretrain/qwen3_longsft_full_swa_ttt_aux.yaml"
+CONFIG="configs/pretrain/qwen3_longsft_swa_full_1to3_ttt_aux.yaml"
 WANDB_PROJECT="${WANDB_PROJECT:-in-place-ttt}"
-WANDB_NAME="${WANDB_NAME:-longsft-full-swa-ttt-aux-amp}"
+WANDB_NAME="${WANDB_NAME:-longsft-full-swa-1to3-swa-ttt-aux-amp}"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export TOKENIZERS_PARALLELISM=false
@@ -29,7 +29,7 @@ if [[ "$NNODES" == "1" ]]; then
   additional_args="--standalone"
 fi
 
-LOG_FILE="./logs/log-longsft-swa-ttt-aux-amp_node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).txt"
+LOG_FILE="./logs/log-longsft-full-swa-1to3-swa-ttt-aux-amp_node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).txt"
 
 torchrun \
   --nproc_per_node "$NPROC_PER_NODE" \

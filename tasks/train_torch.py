@@ -112,6 +112,10 @@ class EvalTrainingArguments(TrainingArguments):
         default=8,
         metadata={"help": "Number of eval dataloader steps per eval run."},
     )
+    stage_stop_steps: int = field(
+        default=0,
+        metadata={"help": "Stop this stage at the given global step while keeping the full max_steps schedule."},
+    )
 
 
 @dataclass
@@ -451,6 +455,25 @@ def main():
     )
     environ_meter = helper.EnvironMeter(**_filter_kwargs_for_callable(helper.EnvironMeter, environ_meter_kwargs))
 
+    def save_training_checkpoint() -> None:
+        nonlocal save_checkpoint_path
+        helper.empty_cache()
+        save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
+        state = {
+            "model": model,
+            "optimizer": optimizer,
+            "extra_state": {
+                "global_step": global_step,
+                "lr_scheduler": lr_scheduler.state_dict(),
+                "train_dataloader": train_dataloader.state_dict(),
+                "environ_meter": environ_meter.state_dict(),
+                "torch_rng_state": torch.get_rng_state(),
+            },
+        }
+        Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+        dist.barrier()
+        logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+
     if args.train.load_checkpoint_path:
         state = {"model": model, "optimizer": optimizer, "extra_state": {}}  # cannot be None
         Checkpointer.load(args.train.load_checkpoint_path, state)
@@ -475,6 +498,7 @@ def main():
     logger.info(
         f"rank{args.train.local_rank} Start training, train_steps: {train_steps}, epochs: {args.train.num_train_epochs}"
     )
+    stop_training = False
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
@@ -586,44 +610,22 @@ def main():
                     profiler.stop()
 
             if args.train.save_steps and global_step % args.train.save_steps == 0:
-                helper.empty_cache()
-                save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
-                state = {
-                    "model": model,
-                    "optimizer": optimizer,
-                    "extra_state": {
-                        "global_step": global_step,
-                        "lr_scheduler": lr_scheduler.state_dict(),
-                        "train_dataloader": train_dataloader.state_dict(),
-                        "environ_meter": environ_meter.state_dict(),
-                        "torch_rng_state": torch.get_rng_state(),
-                    },
-                }
-                Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+                save_training_checkpoint()
 
-                dist.barrier()
-                logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+            if args.train.stage_stop_steps and global_step >= args.train.stage_stop_steps:
+                if save_checkpoint_path != os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}"):
+                    save_training_checkpoint()
+                logger.info_rank0(f"Reached stage_stop_steps={args.train.stage_stop_steps}; stop this stage.")
+                stop_training = True
+                break
 
         data_loader_tqdm.close()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
-            helper.empty_cache()
-            save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
-            state = {
-                "model": model,
-                "optimizer": optimizer,
-                "extra_state": {
-                    "global_step": global_step,
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                    "train_dataloader": train_dataloader.state_dict(),
-                    "environ_meter": environ_meter.state_dict(),
-                    "torch_rng_state": torch.get_rng_state(),
-                },
-            }
-            Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-            dist.barrier()
-            logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+            save_training_checkpoint()
+        if stop_training:
+            break
 
     synchronize()
     # release memory

@@ -37,8 +37,6 @@ train:
   micro_batch_size: 1
   rmpad: false
   use_wandb: true
-  wandb_project: in-place-ttt
-  wandb_name: longsft-full-swa-ttt-aux-amp
   max_steps: 4000
   rmpad_with_pos_ids: false
   dyn_bsz_margin: 0

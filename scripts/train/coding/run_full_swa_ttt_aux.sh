@@ -4,9 +4,7 @@
 set -x
 set -o pipefail
 
-CONFIG="configs/pretrain/qwen3_longsft_full_swa_ttt_aux.yaml"
-WANDB_PROJECT="${WANDB_PROJECT:-in-place-ttt}"
-WANDB_NAME="${WANDB_NAME:-longsft-full-swa-ttt-aux-amp}"
+CONFIG="configs/pretrain/qwen3_coding_full_swa_ttt_aux.yaml"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export TOKENIZERS_PARALLELISM=false
@@ -37,7 +35,4 @@ torchrun \
   --node_rank "$NODE_RANK" \
   --master_addr "$MASTER_ADDR" \
   --master_port "$MASTER_PORT" \
-  $additional_args tasks/train_torch.py "$CONFIG" \
-  --train.wandb_project "$WANDB_PROJECT" \
-  --train.wandb_name "$WANDB_NAME" \
-  "$@" 2>&1 | tee "$LOG_FILE"
+  $additional_args tasks/train_torch.py "$CONFIG" "$@" 2>&1 | tee "$LOG_FILE"

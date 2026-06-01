@@ -79,7 +79,7 @@ As used in this repo, the end-to-end workflow is:
 1. Provide your own VeOmni-compatible processed dataset and base model assets.
 2. Launch continual pretraining with VeOmni through `train.sh` and `tasks/train_torch.py`.
 3. Export DCP checkpoints into HuggingFace format with `scripts/merge_dcp_to_hf.py`.
-4. Run TTT-aware inference and RULER evaluation with `inference_model/`, `eval.sh`, and `eval_config/`.
+4. Run TTT-aware inference and RULER evaluation with `inference_model/`, `eval.sh`, and `eval/eval_config/`.
 
 The repository includes recommended training configs for Qwen3-8B and LLaMA-3.1-8B, checkpoint conversion utilities, and a full RULER evaluation pipeline via OpenCompass from 4K to 256K context lengths.
 
@@ -261,10 +261,10 @@ Single-config smoke run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 -c \
-  "import inference_model; from opencompass.cli.main import main; import sys; sys.argv=['opencompass','eval_config/ruler_4k.py','--debug']; main()"
+  "import inference_model; from opencompass.cli.main import main; import sys; sys.argv=['opencompass','eval/eval_config/ruler_4k.py','--debug']; main()"
 ```
 
-To evaluate your own checkpoints, update `eval_config/models.py` with your model name and HuggingFace checkpoint path.
+To evaluate your own checkpoints, update `eval/eval_config/models.py` with your model name and HuggingFace checkpoint path.
 
 ## Features
 
@@ -272,7 +272,7 @@ To evaluate your own checkpoints, update `eval_config/models.py` with your model
 - **LM-aligned fast-weight updates.** The optimization target is derived for autoregressive language modeling instead of a generic reconstruction objective.
 - **Long-context continual pretraining stack.** The repo includes recommended Qwen3-8B and LLaMA-3.1-8B configs built on VeOmni and FSDP2.
 - **Checkpoint export path.** `scripts/merge_dcp_to_hf.py` converts VeOmni DCP checkpoints into HuggingFace format.
-- **TTT-aware inference and evaluation.** `inference_model/`, `eval.sh`, and `eval_config/` cover inference and RULER evaluation through OpenCompass.
+- **TTT-aware inference and evaluation.** `inference_model/`, `eval.sh`, and `eval/eval_config/` cover inference and RULER evaluation through OpenCompass.
 - **Long-context coverage.** The evaluation setup spans 4K, 8K, 16K, 32K, 64K, 128K, and includes a 256K config.
 
 ## License

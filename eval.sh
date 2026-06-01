@@ -29,7 +29,7 @@ for len in ${LENGTHS[@]}; do
 import inference_model
 from opencompass.cli.main import main
 import sys
-sys.argv = ['opencompass', 'eval_config/ruler_${len}.py', '--debug']
+sys.argv = ['opencompass', 'eval/eval_config/ruler_${len}.py', '--debug']
 main()
 " &
     sleep 5
