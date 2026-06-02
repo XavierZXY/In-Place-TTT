@@ -35,9 +35,11 @@ def test_longsft_swa_full_1to3_launcher_points_to_hybrid_config():
     text = launcher.read_text(encoding="utf-8")
     assert 'CONFIG="configs/pretrain/qwen3_longsft_swa_full_1to3_ttt_aux.yaml"' in text
     assert 'WANDB_PROJECT="${WANDB_PROJECT:-in-place-ttt}"' in text
-    assert 'WANDB_NAME="${WANDB_NAME:-longsft-full-swa-1to3-swa-ttt-aux-amp}"' in text
+    assert 'WANDB_NAME="${WANDB_NAME:-longsft-v0-swa-anchor-ttt-aux-swa4096-chunk1024-64k}"' in text
     assert '--train.wandb_project "$WANDB_PROJECT"' in text
     assert '--train.wandb_name "$WANDB_NAME"' in text
+    assert 'runtime_args+=(--data.train_path "$TRAIN_PATH")' in text
+    assert 'runtime_args+=(--data.eval_path "$EVAL_PATH")' in text
     assert 'REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"' in text
 
 
@@ -55,3 +57,20 @@ def test_longsft_swa_window_anneal_launcher_keeps_full_swa_1to3_config():
     assert 'IFS=\',\' read -r -a STOP_STEPS <<< "$STAGE_STOP_STEPS"' in text
     assert 'stop_args=(--train.stage_stop_steps "$stop_step")' in text
     assert '--model.foundation "{\\"ttt_compress_window\\": ${window_size}}"' in text
+
+
+def test_longsft_v0_swa_anchor_launcher_points_to_v0_aligned_config():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = repo_root / "scripts" / "train" / "longsft" / "run_v0_swa_anchor_ttt_aux.sh"
+
+    assert launcher.is_file()
+
+    text = launcher.read_text(encoding="utf-8")
+    assert 'CONFIG="configs/pretrain/qwen3_longsft_v0_swa_anchor_ttt_aux.yaml"' in text
+    assert 'WANDB_PROJECT="${WANDB_PROJECT:-in-place-ttt}"' in text
+    assert 'WANDB_NAME="${WANDB_NAME:-longsft-v0-swa-anchor-ttt-aux-swa4096-chunk1024-64k}"' in text
+    assert '--train.wandb_project "$WANDB_PROJECT"' in text
+    assert '--train.wandb_name "$WANDB_NAME"' in text
+    assert 'runtime_args+=(--data.train_path "$TRAIN_PATH")' in text
+    assert 'runtime_args+=(--data.eval_path "$EVAL_PATH")' in text
+    assert 'REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"' in text
