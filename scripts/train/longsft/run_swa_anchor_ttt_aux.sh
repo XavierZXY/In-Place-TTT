@@ -1,12 +1,12 @@
 #!/bin/bash
-# V0-aligned SWA(4096) + 9 full-attention anchors + In-Place TTT aux.
+# aligned SWA(4096) + 9 full-attention anchors + In-Place TTT aux.
 
 set -x
 set -o pipefail
 
-CONFIG="configs/pretrain/qwen3_longsft_v0_swa_anchor_ttt_aux.yaml"
+CONFIG="configs/pretrain/qwen3_longsft_swa_anchor_ttt_aux.yaml"
 WANDB_PROJECT="${WANDB_PROJECT:-in-place-ttt}"
-WANDB_NAME="${WANDB_NAME:-longsft-swa-anchor-ttt-aux-swa4096-chunk1024-64k}"
+WANDB_NAME="${WANDB_NAME:-longsft-swa-anchor-ttt-aux-swa4096-chunk1024-32k}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export TOKENIZERS_PARALLELISM=false

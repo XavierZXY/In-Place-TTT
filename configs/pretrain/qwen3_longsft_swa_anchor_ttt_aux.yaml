@@ -20,18 +20,18 @@ model:
     ttt_aux_loss_weight: 0.1
 
 data:
-  train_path: /workspace/post_training_data_cloud/weilai/datasets/long-sft-mix-16k-64k/train.jsonl
-  eval_path: /workspace/post_training_data_cloud/weilai/datasets/long-sft-mix-16k-64k/val.jsonl
+  train_path: /zouxiangyu/data_ttt/long-sft/train.jsonl
+  eval_path: /zouxiangyu/data_ttt/long-sft/val.jsonl
   dataloader_type: native
   datasets_type: iterable
   data_type: conversation
   chat_template: chatml
-  max_seq_len: 65536
+  max_seq_len: 32768
   text_keys: messages
   drop_last: true
 
 train:
-  output_dir: /zouxiangyu/codes/Learning/In-Place-TTT/outputs/longsft-swa-anchor-ttt-aux-swa4096-chunk1024-64k
+  output_dir: /zouxiangyu/codes/Learning/In-Place-TTT/outputs/longsft-swa-anchor-ttt-aux-swa4096-chunk1024-32k
   load_checkpoint_path: "auto"
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
@@ -40,13 +40,13 @@ train:
   rmpad: false
   use_wandb: true
   wandb_project: in-place-ttt
-  wandb_name: longsft-swa-anchor-ttt-aux-swa4096-chunk1024-64k
+  wandb_name: longsft-swa-anchor-ttt-aux-swa4096-chunk1024-32k
   max_steps: 8000
   rmpad_with_pos_ids: false
   dyn_bsz_margin: 0
   dyn_bsz: false
   optimizer: adamw
-  lr: 1.0e-5
+  lr: 5.0e-5
   lr_warmup_ratio: 0.05
   lr_decay_style: cosine
   lr_decay_ratio: 0.90
@@ -58,6 +58,6 @@ train:
   init_device: meta
   ckpt_manager: dcp
   save_steps: 1000
-  eval_steps: 100
+  eval_steps: 500
   eval_batches: 8
   save_hf_weights: false
