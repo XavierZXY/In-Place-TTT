@@ -328,13 +328,35 @@ def load_model(
     dtype_name: str,
     attn_implementation: str,
     device: str,
+    disable_ttt_fast_weights: bool,
+    ttt_prefill_update_partial: bool,
+    ttt_prefill_partial_min_tokens: int | None,
 ) -> tuple[torch.nn.Module, Any, Any]:
     print(f"[load] model_path={model_path}")
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    if disable_ttt_fast_weights:
+        original_ttt_lr = getattr(config, "ttt_lr", None)
+        config.ttt_lr = 0.0
+        config.disable_ttt_fast_weights = True
+        print(f"[load] disable_ttt_fast_weights=True original_ttt_lr={original_ttt_lr} effective_ttt_lr=0.0")
+    if ttt_prefill_update_partial:
+        config.ttt_prefill_update_partial = True
+        if ttt_prefill_partial_min_tokens is not None:
+            if ttt_prefill_partial_min_tokens < 1:
+                raise ValueError(
+                    "ttt_prefill_partial_min_tokens must be >= 1, "
+                    f"got {ttt_prefill_partial_min_tokens}"
+                )
+            config.ttt_prefill_partial_min_tokens = int(ttt_prefill_partial_min_tokens)
+        print(
+            "[load] ttt_prefill_update_partial=True "
+            f"min_tokens={getattr(config, 'ttt_prefill_partial_min_tokens', 1)}"
+        )
     model_cls = _model_class(config)
 
     model = model_cls.from_pretrained(
         model_path,
+        config=config,
         torch_dtype=_torch_dtype(dtype_name),
         attn_implementation=attn_implementation,
     ).eval()
@@ -661,6 +683,7 @@ def eval_length(
     repeat_stop_diversity_top_ratio: float,
     device: str,
     batch_size: int,
+    run_meta: dict[str, Any],
 ) -> dict[str, Any]:
     sample_rows = _load_samples(ruler_root, length, n_per_task, max_new_tokens)
     by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -800,6 +823,7 @@ def eval_length(
     summary["__stop_strings__"] = stop_strings
     summary["__assistant_prefill__"] = assistant_prefill
     summary["__batch_size__"] = batch_size
+    summary["__run_meta__"] = run_meta
     summary["__repetition_stop__"] = {
         "enabled": repetition_stop,
         "triggered": repetition_stop_count,
@@ -842,6 +866,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strip_think", action="store_true")
     parser.add_argument("--stop_strings", nargs="*", default=[])
     parser.add_argument("--assistant_prefill", default="")
+    parser.add_argument(
+        "--disable_ttt_fast_weights",
+        action="store_true",
+        help="Keep TTT layers enabled but set ttt_lr=0 to disable online fast-weight updates.",
+    )
+    parser.add_argument(
+        "--ttt_prefill_update_partial",
+        action="store_true",
+        help="Update TTT fast weights with the final incomplete prefill chunk before decoding.",
+    )
+    parser.add_argument(
+        "--ttt_prefill_partial_min_tokens",
+        type=int,
+        default=None,
+        help="Minimum tail tokens required by --ttt_prefill_update_partial.",
+    )
     parser.add_argument("--disable_repetition_stop", action="store_true")
     parser.add_argument("--repeat_stop_min_new_tokens", type=int, default=96)
     parser.add_argument("--repeat_stop_min_ngram", type=int, default=8)
@@ -863,8 +903,21 @@ def main() -> None:
         dtype_name=args.dtype,
         attn_implementation=args.attn_implementation,
         device=args.device,
+        disable_ttt_fast_weights=args.disable_ttt_fast_weights,
+        ttt_prefill_update_partial=args.ttt_prefill_update_partial,
+        ttt_prefill_partial_min_tokens=args.ttt_prefill_partial_min_tokens,
     )
     eos_token_ids = _resolve_eos_token_ids(config, tokenizer, args.eos_token_ids)
+    run_meta = {
+        "ttt_mode": getattr(config, "ttt_mode", None),
+        "ttt_layers": getattr(config, "ttt_layers", None),
+        "ttt_lr": getattr(config, "ttt_lr", None),
+        "ttt_chunk": getattr(config, "ttt_chunk", None),
+        "ttt_target": getattr(config, "ttt_target", None),
+        "ttt_prefill_update_partial": getattr(config, "ttt_prefill_update_partial", None),
+        "ttt_prefill_partial_min_tokens": getattr(config, "ttt_prefill_partial_min_tokens", None),
+        "disable_ttt_fast_weights": args.disable_ttt_fast_weights,
+    }
 
     print(f"[main] output={out_dir}")
     if args.batch_size < 1:
@@ -897,6 +950,7 @@ def main() -> None:
             repeat_stop_diversity_top_ratio=args.repeat_stop_diversity_top_ratio,
             device=args.device,
             batch_size=args.batch_size,
+            run_meta=run_meta,
         )
 
     summary_path = out_dir / "summary_all_lengths.json"

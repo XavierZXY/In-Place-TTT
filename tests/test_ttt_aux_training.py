@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from in_place_ttt.ttt_aux.training import accumulate_ttt_aux_grads
+from in_place_ttt.ttt_aux.training import accumulate_ttt_aux_grads, build_ttt_optimizer_param_groups
 
 
 class _FakeMlp(nn.Module):
@@ -51,3 +51,36 @@ def test_accumulate_ttt_aux_grads_updates_only_ttt_aux_params():
     assert torch.allclose(ttt_layer.mlp.ttt_proj.weight.grad, torch.full_like(ttt_layer.mlp.ttt_proj.weight, 0.25))
     assert non_ttt_layer.mlp.ttt_conv.weight.grad is None
     assert ttt_layer.mlp.down_proj.weight.grad is None
+
+
+def test_build_ttt_optimizer_param_groups_is_opt_in():
+    model = _FakeCausalLm()
+
+    assert build_ttt_optimizer_param_groups(model, base_lr=1e-4, base_weight_decay=0.1) is None
+
+
+def test_build_ttt_optimizer_param_groups_splits_only_ttt_aux_params():
+    model = _FakeCausalLm()
+    ttt_layer = model.model.layers[0]
+    non_ttt_layer = model.model.layers[1]
+
+    groups = build_ttt_optimizer_param_groups(
+        model,
+        base_lr=1e-4,
+        base_weight_decay=0.1,
+        lr_multiplier=3.0,
+        weight_decay=0.0,
+    )
+
+    assert groups is not None
+    assert len(groups) == 2
+    assert groups[0]["lr"] == 1e-4
+    assert groups[0]["weight_decay"] == 0.1
+    assert abs(groups[1]["lr"] - 3e-4) < 1e-12
+    assert groups[1]["weight_decay"] == 0.0
+
+    ttt_param_ids = {id(param) for param in groups[1]["params"]}
+    assert id(ttt_layer.mlp.ttt_conv.weight) in ttt_param_ids
+    assert id(ttt_layer.mlp.ttt_proj.weight) in ttt_param_ids
+    assert id(non_ttt_layer.mlp.ttt_conv.weight) not in ttt_param_ids
+    assert id(ttt_layer.mlp.down_proj.weight) not in ttt_param_ids

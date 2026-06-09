@@ -39,6 +39,7 @@ from tqdm import trange
 import hf_models  # noqa: F401
 from in_place_ttt.ttt_aux.training import (
     accumulate_ttt_aux_grads as _accumulate_ttt_aux_grads,
+    build_ttt_optimizer_param_groups as _build_ttt_optimizer_param_groups,
     get_last_ttt_aux_loss as _get_last_ttt_aux_loss,
 )
 
@@ -390,12 +391,28 @@ def main():
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
 
+    optimizer_param_groups = _build_ttt_optimizer_param_groups(
+        model,
+        base_lr=args.train.lr,
+        base_weight_decay=args.train.weight_decay,
+        lr_multiplier=float(getattr(model_config, "ttt_param_lr_multiplier", 1.0)),
+        weight_decay=getattr(model_config, "ttt_param_weight_decay", None),
+    )
+    if optimizer_param_groups is not None:
+        ttt_group = optimizer_param_groups[-1]
+        logger.info_rank0(
+            "Using separate TTT optimizer group: "
+            f"params={sum(param.numel() for param in ttt_group['params'])}, "
+            f"lr={ttt_group['lr']:.2e}, weight_decay={ttt_group['weight_decay']}"
+        )
+
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
         weight_decay=args.train.weight_decay,
         fused=True,
         optimizer_type=args.train.optimizer,
+        param_groups=optimizer_param_groups,
     )
     if get_optimizer_pre_hook is not None:
         optimizer_pre_hook = get_optimizer_pre_hook(model, model_config, args.train.data_parallel_mode)
@@ -524,6 +541,9 @@ def main():
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
             total_loss = 0
+            total_main_loss = 0
+            total_ttt_aux_loss = 0
+            total_ttt_aux_raw_loss = 0
             synchronize()
             start_time = time.time()
 
@@ -548,15 +568,27 @@ def main():
                 loss_scale = length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
 
                 with model_bwd_context:
+                    raw_aux_loss = _get_last_ttt_aux_loss(model_outputs, model)
                     loss.backward()
+                    ttt_aux_weight = float(getattr(model_config, "ttt_aux_loss_weight", 0.0))
                     scaled_aux_loss = _accumulate_ttt_aux_grads(
                         model,
-                        _get_last_ttt_aux_loss(model_outputs, model),
-                        float(getattr(model_config, "ttt_aux_loss_weight", 0.0)),
+                        raw_aux_loss,
+                        ttt_aux_weight,
                         loss_scale,
                     )
 
-                total_loss += loss.item() + (scaled_aux_loss.item() if scaled_aux_loss is not None else 0.0)
+                main_loss_item = loss.item()
+                aux_loss_item = scaled_aux_loss.item() if scaled_aux_loss is not None else 0.0
+                raw_aux_loss_item = (
+                    (raw_aux_loss.detach() * loss_scale).item()
+                    if torch.is_tensor(raw_aux_loss)
+                    else 0.0
+                )
+                total_main_loss += main_loss_item
+                total_ttt_aux_loss += aux_loss_item
+                total_ttt_aux_raw_loss += raw_aux_loss_item
+                total_loss += main_loss_item + aux_loss_item
                 del micro_batch
 
             grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
@@ -568,21 +600,37 @@ def main():
                 grad_norm = grad_norm.full_tensor().item()
 
             # collect mean loss across data parallel group
-            total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
+            total_loss, total_main_loss, total_ttt_aux_loss, total_ttt_aux_raw_loss, grad_norm = all_reduce(
+                (total_loss, total_main_loss, total_ttt_aux_loss, total_ttt_aux_raw_loss, grad_norm),
+                group=get_parallel_state().fsdp_group,
+            )
             synchronize()
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.4f}, lr: {lr:.2e}", refresh=False
+                f"loss: {total_loss:.4f}, main: {total_main_loss:.4f}, "
+                f"ttt_aux: {total_ttt_aux_loss:.4f}, ttt_aux_raw: {total_ttt_aux_raw_loss:.4f}, "
+                f"grad_norm: {grad_norm:.4f}, lr: {lr:.2e}",
+                refresh=False,
             )
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
                 if args.train.use_wandb:
                     train_metrics.update(
-                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
+                        {
+                            "training/loss": total_loss,
+                            "training/main_loss": total_main_loss,
+                            "training/ttt_aux_loss": total_ttt_aux_loss,
+                            "training/ttt_aux_raw_loss": total_ttt_aux_raw_loss,
+                            "training/ttt_aux_loss_weight": float(
+                                getattr(model_config, "ttt_aux_loss_weight", 0.0)
+                            ),
+                            "training/grad_norm": grad_norm,
+                            "training/lr": lr,
+                        }
                     )
                     wandb.log(train_metrics, step=global_step)
 

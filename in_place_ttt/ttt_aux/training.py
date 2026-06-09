@@ -47,6 +47,61 @@ def collect_ttt_aux_params(model):
     return params
 
 
+def build_ttt_optimizer_param_groups(
+    model,
+    *,
+    base_lr: float,
+    base_weight_decay: float,
+    lr_multiplier: float = 1.0,
+    weight_decay: float | None = None,
+):
+    lr_multiplier = float(lr_multiplier)
+    if lr_multiplier <= 0.0:
+        raise ValueError(f"ttt_param_lr_multiplier must be > 0, got {lr_multiplier}")
+
+    ttt_weight_decay = base_weight_decay if weight_decay is None else float(weight_decay)
+    if ttt_weight_decay < 0.0:
+        raise ValueError(f"ttt_param_weight_decay must be >= 0, got {ttt_weight_decay}")
+
+    if lr_multiplier == 1.0 and weight_decay is None:
+        return None
+
+    ttt_param_ids = {id(param) for param in collect_ttt_aux_params(model)}
+    if not ttt_param_ids:
+        return None
+
+    base_params = []
+    ttt_params = []
+    for _, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in ttt_param_ids:
+            ttt_params.append(param)
+        else:
+            base_params.append(param)
+
+    if not ttt_params:
+        return None
+
+    param_groups = []
+    if base_params:
+        param_groups.append(
+            {
+                "params": base_params,
+                "lr": float(base_lr),
+                "weight_decay": float(base_weight_decay),
+            }
+        )
+    param_groups.append(
+        {
+            "params": ttt_params,
+            "lr": float(base_lr) * lr_multiplier,
+            "weight_decay": ttt_weight_decay,
+        }
+    )
+    return param_groups
+
+
 def accumulate_ttt_aux_grads(model, aux_loss, aux_loss_weight, loss_scale):
     if aux_loss is None or aux_loss_weight <= 0.0:
         return None

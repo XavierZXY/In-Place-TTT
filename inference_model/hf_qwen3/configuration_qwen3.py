@@ -187,6 +187,8 @@ class Qwen3Config(PretrainedConfig):
         ttt_lr=0.3,
         ttt_chunk=8192,
         ttt_target="hidden_states",
+        ttt_prefill_update_partial=False,
+        ttt_prefill_partial_min_tokens=1,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -238,6 +240,13 @@ class Qwen3Config(PretrainedConfig):
         self.ttt_target = ttt_target
         if self.ttt_target not in {"hidden_states", "input_embed"}:
             raise ValueError("ttt_target must be one of {'hidden_states', 'input_embed'}")
+        self.ttt_prefill_update_partial = bool(ttt_prefill_update_partial)
+        self.ttt_prefill_partial_min_tokens = int(ttt_prefill_partial_min_tokens)
+        if self.ttt_prefill_partial_min_tokens < 1:
+            raise ValueError(
+                "ttt_prefill_partial_min_tokens must be >= 1, "
+                f"got {self.ttt_prefill_partial_min_tokens}"
+            )
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,

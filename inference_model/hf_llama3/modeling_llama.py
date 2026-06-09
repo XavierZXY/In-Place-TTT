@@ -208,7 +208,7 @@ class LlamaMLP(nn.Module):
             x = torch.cat([x, padding_embeddings], dim=1)
         return rearrange(x, "b (t c) d -> b t c d", c=self.ttt_chunk)
 
-    def forward(self, x, t=None, past_w=None):
+    def forward(self, x, t=None, past_w=None, update_partial=False):
         h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         # Non-TTT layer path: identical to library
         if not hasattr(self, "ttt_conv"):
@@ -218,7 +218,7 @@ class LlamaMLP(nn.Module):
         if t is None:
             return nn.functional.linear(h, present_down_proj_w, self.down_proj.bias), present_down_proj_w
         bs, seq_len, _ = x.shape
-        if seq_len < self.ttt_chunk:
+        if seq_len < self.ttt_chunk and not update_partial:
             return nn.functional.linear(h, present_down_proj_w, self.down_proj.bias), present_down_proj_w
         # Pad and chunk
         t_padded = self.padding(t)
@@ -234,7 +234,7 @@ class LlamaMLP(nn.Module):
         for i, current_y, current_t, current_h in zip(range(chunk_num), y[0], t_conv[0], h_padded[0]):
             current_y = contract("d h, c h -> c d", current_w, current_h)
             y[0][i] = current_y
-            if seq_len % self.ttt_chunk == 0 or i != chunk_num - 1:
+            if seq_len % self.ttt_chunk == 0 or i != chunk_num - 1 or update_partial:
                 if self.ttt_proj is not None:
                     dw = (
                         contract("c h, c d, d e -> e h", current_h, current_t, self.ttt_proj.weight) * self.ttt_lr
@@ -367,6 +367,8 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ttt_chunk = getattr(config, "ttt_chunk", 8192)
+        self.ttt_prefill_update_partial = bool(getattr(config, "ttt_prefill_update_partial", False))
+        self.ttt_prefill_partial_min_tokens = int(getattr(config, "ttt_prefill_partial_min_tokens", 1))
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -415,17 +417,26 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
                 present_h = torch.cat([past_h, hidden_states], dim=1)
                 present_t = torch.cat([past_t, target_states], dim=1)
 
-            if present_h.shape[1] < self.ttt_chunk:
+            tail_len = present_h.shape[1] % self.ttt_chunk
+            update_partial = (
+                self.ttt_prefill_update_partial
+                and hidden_states.shape[1] > 1
+                and tail_len >= self.ttt_prefill_partial_min_tokens
+            )
+            if present_h.shape[1] < self.ttt_chunk and not update_partial:
                 hidden_states, present_w = self.mlp(hidden_states, None, past_w)
             else:
-                all_hidden_states, present_w = self.mlp(present_h, present_t, past_w)
+                all_hidden_states, present_w = self.mlp(
+                    present_h, present_t, past_w, update_partial=update_partial
+                )
                 hidden_states = all_hidden_states[:, -hidden_states.shape[1] :]
 
             # Keep the remainder of the last incomplete chunk for next step
-            present_h_tail = present_h[:, -(present_h.shape[1] % self.ttt_chunk) :]
-            present_t_tail = present_t[:, -(present_t.shape[1] % self.ttt_chunk) :]
-            if present_h_tail.shape[1] % self.ttt_chunk == 0:
+            if tail_len == 0 or update_partial:
                 present_h_tail, present_t_tail = None, None
+            else:
+                present_h_tail = present_h[:, -tail_len:]
+                present_t_tail = present_t[:, -tail_len:]
             if past_key_values is not None:
                 past_key_values.TTT_update((present_h_tail, present_t_tail, present_w), self.layer_idx)
         hidden_states = residual + hidden_states

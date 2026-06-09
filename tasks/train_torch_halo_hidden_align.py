@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HALO Stage-2 style KD training entry for the local VeOmni stack."""
+"""HALO Stage-1 style hidden-state alignment training entry."""
 
 # ruff: noqa: E402
 
@@ -23,6 +23,7 @@ from dataclasses import asdict
 from datetime import timedelta
 from functools import partial
 from typing import Any, Dict, List
+
 
 os.environ["MODELING_BACKEND"] = "hf"
 
@@ -35,7 +36,11 @@ import hf_models  # noqa: F401
 from in_place_ttt.ttt_aux.training import build_ttt_optimizer_param_groups
 from tasks import train_torch as base
 from tasks.eval_control import should_run_eval
-from tasks.halo_kd_distillation import HaloKDOrchestrator
+from tasks.halo_hidden_alignment import (
+    HiddenAlignmentOrchestrator,
+    configure_hidden_alignment_trainable_params,
+    resolve_hidden_align_layers,
+)
 
 
 logger = base.logger
@@ -67,16 +72,32 @@ def _build_transform(args, tokenizer):
     raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
 
 
-def _pop_distill_config(args) -> tuple[Dict[str, Any], Dict[str, Any]]:
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y"}:
+            return True
+        if lowered in {"0", "false", "no", "n"}:
+            return False
+    return bool(value)
+
+
+def _pop_hidden_align_config(args) -> tuple[Dict[str, Any], Dict[str, Any]]:
     foundation = dict(args.model.foundation or {})
-    distill = {
-        "teacher_path": foundation.pop("distill_teacher_path", None) or args.model.model_path,
-        "alpha_ce": float(foundation.pop("distill_alpha_ce", 0.0)),
-        "alpha_kl": float(foundation.pop("distill_alpha_kl", 1.0)),
-        "temperature": float(foundation.pop("distill_temperature", 1.0)),
-        "chunk_size": int(foundation.pop("distill_chunk_size", 128)),
+    align = {
+        "teacher_path": (
+            foundation.pop("hidden_align_teacher_path", None)
+            or foundation.pop("distill_teacher_path", None)
+            or args.model.model_path
+        ),
+        "loss_fn": str(foundation.pop("hidden_align_loss_fn", "mse")),
+        "layers": foundation.pop("hidden_align_layers", None),
+        "skip_ttt_layers": _as_bool(foundation.pop("hidden_align_skip_ttt_layers", False)),
+        "train_scope": str(foundation.pop("hidden_align_train_scope", "layers")),
     }
-    return foundation, distill
+    return foundation, align
 
 
 def _teacher_foundation_config(teacher_path: str) -> Dict[str, Any]:
@@ -93,13 +114,11 @@ def _teacher_foundation_config(teacher_path: str) -> Dict[str, Any]:
     }
 
 
-def _count_loss_tokens(micro_batch: Dict[str, Any], use_kd_tokens: bool) -> torch.Tensor:
-    if use_kd_tokens:
-        attention_mask = micro_batch.get("attention_mask")
-        if attention_mask is not None:
-            return torch.sum(attention_mask != 0)
-        return torch.tensor(micro_batch["input_ids"].numel(), device=micro_batch["input_ids"].device)
-    return torch.sum(micro_batch["labels"] != base.IGNORE_INDEX)
+def _count_align_tokens(micro_batch: Dict[str, Any]) -> torch.Tensor:
+    attention_mask = micro_batch.get("attention_mask")
+    if attention_mask is not None:
+        return torch.sum(attention_mask != 0)
+    return torch.tensor(micro_batch["input_ids"].numel(), device=micro_batch["input_ids"].device)
 
 
 def main():
@@ -128,16 +147,7 @@ def main():
     if args.train.global_rank == 0:
         base.save_args(args, args.train.output_dir)
 
-    student_foundation, distill_cfg = _pop_distill_config(args)
-    logger.info_rank0(
-        "HALO KD: "
-        f"teacher={distill_cfg['teacher_path']}, "
-        f"alpha_ce={distill_cfg['alpha_ce']}, "
-        f"alpha_kl={distill_cfg['alpha_kl']}, "
-        f"temperature={distill_cfg['temperature']}, "
-        f"chunk_size={distill_cfg['chunk_size']}"
-    )
-    use_kd_token_count = distill_cfg["alpha_kl"] > 0.0 and distill_cfg["alpha_ce"] <= 0.0
+    student_foundation, align_cfg = _pop_hidden_align_config(args)
 
     Checkpointer = base.build_checkpointer(
         dist_backend=args.train.data_parallel_mode,
@@ -184,6 +194,26 @@ def main():
         init_device=args.train.init_device,
         config_kwargs=student_foundation,
     )
+    model_config = student_model.config
+    align_layers = resolve_hidden_align_layers(
+        model_config,
+        align_cfg["layers"],
+        skip_ttt_layers=align_cfg["skip_ttt_layers"],
+    )
+    trainable_params = configure_hidden_alignment_trainable_params(
+        student_model,
+        align_layers,
+        train_scope=align_cfg["train_scope"],
+    )
+    logger.info_rank0(
+        "HALO hidden alignment: "
+        f"teacher={align_cfg['teacher_path']}, "
+        f"loss_fn={align_cfg['loss_fn']}, "
+        f"layers={align_layers}, "
+        f"skip_ttt_layers={align_cfg['skip_ttt_layers']}, "
+        f"train_scope={align_cfg['train_scope']}, "
+        f"trainable_params={trainable_params:,}"
+    )
     base.helper.print_device_mem_info("VRAM usage after building student")
 
     get_optimizer_pre_hook = getattr(student_model, "get_optimizer_pre_hook", None)
@@ -199,18 +229,17 @@ def main():
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
-    model_config = student_model.config
     base.helper.print_device_mem_info("VRAM usage after FSDP-wrapping student")
 
     logger.info_rank0("Prepare frozen full-attention teacher model")
     teacher_model = base.build_foundation_model(
         config_path=args.model.config_path,
-        weights_path=distill_cfg["teacher_path"],
+        weights_path=align_cfg["teacher_path"],
         torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
         init_device=args.train.init_device,
-        config_kwargs=_teacher_foundation_config(distill_cfg["teacher_path"]),
+        config_kwargs=_teacher_foundation_config(align_cfg["teacher_path"]),
     )
     for param in teacher_model.parameters():
         param.requires_grad_(False)
@@ -218,7 +247,7 @@ def main():
     teacher_model = base.build_parallelize_model(
         teacher_model,
         init_device=args.train.init_device,
-        weights_path=distill_cfg["teacher_path"],
+        weights_path=align_cfg["teacher_path"],
         enable_full_shard=args.train.enable_full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=False,
@@ -229,13 +258,11 @@ def main():
     )
     base.helper.print_device_mem_info("VRAM usage after FSDP-wrapping teacher")
 
-    model = HaloKDOrchestrator(
+    model = HiddenAlignmentOrchestrator(
         student=student_model,
         teacher=teacher_model,
-        alpha_ce=distill_cfg["alpha_ce"],
-        alpha_kl=distill_cfg["alpha_kl"],
-        temperature=distill_cfg["temperature"],
-        chunk_size=distill_cfg["chunk_size"],
+        layer_idxs=align_layers,
+        loss_fn=align_cfg["loss_fn"],
     )
 
     optimizer_param_groups = build_ttt_optimizer_param_groups(
@@ -362,7 +389,7 @@ def main():
     )
     model.train()
     logger.info(
-        f"rank{args.train.local_rank} Start HALO KD training, train_steps: {train_steps}, "
+        f"rank{args.train.local_rank} Start HALO hidden alignment, train_steps: {train_steps}, "
         f"epochs: {args.train.num_train_epochs}"
     )
 
@@ -392,14 +419,12 @@ def main():
                 base.helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
             total_loss = 0.0
-            total_ce = 0.0
-            total_kl = 0.0
             base.synchronize()
             start_time = time.time()
 
             length_in_batch = torch.tensor(0, dtype=torch.int32, device=base.get_device_type())
             for micro_batch in micro_batches:
-                length_in_batch += _count_loss_tokens(micro_batch, use_kd_token_count).to(length_in_batch.device)
+                length_in_batch += _count_align_tokens(micro_batch).to(length_in_batch.device)
             length_in_batch = base.all_reduce(length_in_batch, op="sum", group=base.get_parallel_state().fsdp_group)
 
             for micro_batch in micro_batches:
@@ -411,17 +436,14 @@ def main():
                 with model_fwd_context:
                     model_outputs = model(**micro_batch, use_cache=False)
 
-                length_in_micro_batch = _count_loss_tokens(micro_batch, use_kd_token_count)
+                length_in_micro_batch = _count_align_tokens(micro_batch)
                 loss_scale = length_in_micro_batch / length_in_batch * base.get_parallel_state().dp_size
                 loss = model_outputs.loss * loss_scale
 
                 with model_bwd_context:
                     loss.backward()
 
-                scale = float(loss_scale.detach().item())
                 total_loss += loss.item()
-                total_ce += float(model_outputs.loss_ce.detach().item()) * scale
-                total_kl += float(model_outputs.loss_kl.detach().item()) * scale
                 del micro_batch
 
             grad_norm = base.veomni_clip_grad_norm(student_model, args.train.max_grad_norm)
@@ -432,18 +454,14 @@ def main():
             if hasattr(grad_norm, "full_tensor"):
                 grad_norm = grad_norm.full_tensor().item()
 
-            total_loss, total_ce, total_kl, grad_norm = base.all_reduce(
-                (total_loss, total_ce, total_kl, grad_norm),
-                group=base.get_parallel_state().fsdp_group,
-            )
+            total_loss, grad_norm = base.all_reduce((total_loss, grad_norm), group=base.get_parallel_state().fsdp_group)
             base.synchronize()
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.4f}, ce: {total_ce:.4f}, kl: {total_kl:.4f}, "
-                f"grad_norm: {grad_norm:.4f}, lr: {lr:.2e}",
+                f"hidden_loss: {total_loss:.4f}, grad_norm: {grad_norm:.4f}, lr: {lr:.2e}",
                 refresh=False,
             )
             data_loader_tqdm.update()
@@ -452,15 +470,15 @@ def main():
                 train_metrics.update(
                     {
                         "training/loss": total_loss,
-                        "training/loss_ce": total_ce,
-                        "training/loss_kl": total_kl,
+                        "training/hidden_align_loss": total_loss,
+                        "training/hidden_align_layers": len(align_layers),
                         "training/grad_norm": grad_norm,
                         "training/lr": lr,
                     }
                 )
                 logger.info_rank0(
-                    f"[Step {global_step}] loss={total_loss:.4f}, ce={total_ce:.4f}, "
-                    f"kl={total_kl:.4f}, grad_norm={grad_norm:.4f}, lr={lr:.2e}, "
+                    f"[Step {global_step}] hidden_loss={total_loss:.4f}, "
+                    f"grad_norm={grad_norm:.4f}, lr={lr:.2e}, "
                     f"tokens/s={train_metrics.get('tokens_per_second(M)', 0):.2f}M, "
                     f"mem={train_metrics.get('max_memory_allocated(GB)', 0):.1f}GB"
                 )
@@ -509,7 +527,6 @@ def main():
             break
 
     base.synchronize()
-    del optimizer, lr_scheduler
     base.helper.empty_cache()
 
     if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
