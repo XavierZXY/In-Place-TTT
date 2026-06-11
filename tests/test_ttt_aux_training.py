@@ -1,7 +1,11 @@
 import torch
 from torch import nn
 
-from in_place_ttt.ttt_aux.training import accumulate_ttt_aux_grads, build_ttt_optimizer_param_groups
+from in_place_ttt.ttt_aux.training import (
+    accumulate_ttt_aux_grads,
+    build_ttt_optimizer_param_groups,
+    pop_ttt_monitor_stats,
+)
 
 
 class _FakeMlp(nn.Module):
@@ -84,3 +88,23 @@ def test_build_ttt_optimizer_param_groups_splits_only_ttt_aux_params():
     assert id(ttt_layer.mlp.ttt_proj.weight) in ttt_param_ids
     assert id(non_ttt_layer.mlp.ttt_conv.weight) not in ttt_param_ids
     assert id(ttt_layer.mlp.down_proj.weight) not in ttt_param_ids
+
+
+def test_pop_ttt_monitor_stats_averages_ttt_layers_and_clears_values():
+    model = _FakeCausalLm()
+    ttt_mlp = model.model.layers[0].mlp
+    non_ttt_mlp = model.model.layers[1].mlp
+    ttt_mlp._last_ttt_monitor_stats = {
+        "delta_weight_sample_ratio": torch.tensor(0.2),
+        "output_delta_sample_ratio": torch.tensor(0.4),
+    }
+    non_ttt_mlp._last_ttt_monitor_stats = {
+        "delta_weight_sample_ratio": torch.tensor(10.0),
+        "output_delta_sample_ratio": torch.tensor(10.0),
+    }
+
+    stats = pop_ttt_monitor_stats(model)
+
+    assert torch.allclose(stats["delta_weight_sample_ratio"], torch.tensor(0.2))
+    assert torch.allclose(stats["output_delta_sample_ratio"], torch.tensor(0.4))
+    assert ttt_mlp._last_ttt_monitor_stats is None

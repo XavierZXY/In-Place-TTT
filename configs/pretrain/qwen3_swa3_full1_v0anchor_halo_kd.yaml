@@ -1,6 +1,5 @@
-# HALO Stage-1 style hidden-state alignment for Full:SWA = 1:3 hybrid + TTT.
-# This warmup aligns selected student decoder-layer outputs to a frozen
-# full-attention Qwen3 teacher before the Stage-2 KL run.
+# HALO Stage-2 style KD for Full:SWA = 1:3 hybrid + TTT on SWA layers only.
+# Full-attention anchors follow papers/HALO/code/hybrid-linear-attention/halo/configs/model/hypenet/hypenet-5b.json.
 
 model:
   model_path: /zouxiangyu/models/Qwen/Qwen3-4B
@@ -8,9 +7,9 @@ model:
   foundation:
     max_position_embeddings: 131072
     rope_theta: 5000000.0
-    # HALO-style 9 full-attention anchors + 27 SWA layers.
+    # 9 full-attention anchors + 27 SWA layers.
     full_attention_layers: [0, 1, 7, 14, 15, 22, 24, 31, 33]
-    # Keep the same TTT placement as the LongSFT/KD experiments.
+    # TTT remains on SWA layers only.
     ttt_layers: [3, 6, 12, 18, 25, 30]
     ttt_mode: true
     ttt_proj: true
@@ -18,17 +17,14 @@ model:
     ttt_chunk: 1024
     ttt_target: input_embed
     ttt_compress_window: 4096
-    # Hidden alignment is the only warmup objective in this stage.
+    # HALO KD stage uses teacher supervision; keep the auxiliary objective off here.
     ttt_aux_loss_weight: 0.0
     # Frozen full-attention teacher. Override with TEACHER_MODEL_PATH in the script.
-    hidden_align_teacher_path: /zouxiangyu/models/Qwen/Qwen3-4B
-    hidden_align_loss_fn: mse
-    # null means all converted layers, i.e. all non-full-attention student layers.
-    hidden_align_layers: null
-    hidden_align_skip_ttt_layers: false
-    # FSDP-friendly default: train whole selected decoder layers.
-    # Use "self_attn" if you want closer token-mixer-only HALO behavior.
-    hidden_align_train_scope: layers
+    distill_teacher_path: /zouxiangyu/models/Qwen/Qwen3-4B
+    distill_alpha_ce: 0.0
+    distill_alpha_kl: 1.0
+    distill_temperature: 1.0
+    distill_chunk_size: 128
 
 data:
   train_path: /zouxiangyu/data_ttt/long-sft/train.jsonl
@@ -37,13 +33,13 @@ data:
   datasets_type: iterable
   data_type: conversation
   chat_template: chatml
-  # HALO Stage 1 is short-context alignment; override MAX_SEQ_LEN for ablations.
-  max_seq_len: 512
+  # This local run keeps 4k conversation context; set MAX_SEQ_LEN=512 for strict HALO Stage-2 length.
+  max_seq_len: 4096
   text_keys: messages
   drop_last: true
 
 train:
-  output_dir: /zouxiangyu/codes/Learning/In-Place-TTT/outputs/longsft-swa-full-halo-1to3-hidden-align-swa4096-chunk1024-512
+  output_dir: /zouxiangyu/codes/Learning/In-Place-TTT/outputs/qwen3-swa3-full1-v0anchor-halo-kd-c1024-4k
   load_checkpoint_path: "auto"
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
@@ -52,13 +48,13 @@ train:
   rmpad: false
   use_wandb: true
   wandb_project: in-place-ttt
-  wandb_name: longsft-swa-full-halo-1to3-hidden-align-swa4096-chunk1024-512
+  wandb_name: qwen3-swa3-full1-v0anchor-halo-kd-c1024-4k
   max_steps: 8000
   rmpad_with_pos_ids: false
   dyn_bsz_margin: 0
   dyn_bsz: false
   optimizer: adamw
-  lr: 1.0e-4
+  lr: 1.0e-5
   lr_warmup_ratio: 0.05
   lr_decay_style: cosine
   lr_decay_ratio: 0.90

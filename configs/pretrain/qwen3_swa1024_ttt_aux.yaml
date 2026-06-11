@@ -1,6 +1,6 @@
 # SWA(1024) + In-Place TTT + JEPA-style aux loss on V-hat.
 # This mirrors the v0 24k amp setup and is launched by
-# scripts/train/longsft/run_full_swa_ttt_aux.sh.
+# scripts/train/longsft/run_swa1024_ttt_aux.sh.
 
 model:
   model_path: /zouxiangyu/models/Qwen/Qwen3-4B
@@ -29,7 +29,7 @@ data:
   drop_last: true
 
 train:
-  output_dir: /zouxiangyu/codes/Learning/In-Place-TTT/outputs/longsft-swa-ttt-aux-amp
+  output_dir: /zouxiangyu/codes/Learning/In-Place-TTT/outputs/qwen3-swa1024-ttt-aux-c256-24k
   load_checkpoint_path: "auto"
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
@@ -38,7 +38,7 @@ train:
   rmpad: false
   use_wandb: true
   wandb_project: in-place-ttt
-  wandb_name: longsft-full-swa-ttt-aux-amp
+  wandb_name: qwen3-swa1024-ttt-aux-c256-24k
   max_steps: 4000
   rmpad_with_pos_ids: false
   dyn_bsz_margin: 0
@@ -46,8 +46,8 @@ train:
   optimizer: adamw
   lr: 1.0e-5
   lr_warmup_ratio: 0.05
-  lr_decay_style: cosine
-  lr_decay_ratio: 0.90
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
   weight_decay: 0.1
   max_grad_norm: 1.0
   enable_mixed_precision: true

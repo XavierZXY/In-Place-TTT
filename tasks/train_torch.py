@@ -40,7 +40,10 @@ import hf_models  # noqa: F401
 from in_place_ttt.ttt_aux.training import (
     accumulate_ttt_aux_grads as _accumulate_ttt_aux_grads,
     build_ttt_optimizer_param_groups as _build_ttt_optimizer_param_groups,
+    compute_ttt_logits_delta_sample_ratio as _compute_ttt_logits_delta_sample_ratio,
+    configure_ttt_only_trainable_params as _configure_ttt_only_trainable_params,
     get_last_ttt_aux_loss as _get_last_ttt_aux_loss,
+    pop_ttt_monitor_stats as _pop_ttt_monitor_stats,
 )
 
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
@@ -243,11 +246,21 @@ def _strip_multisource_fields(micro_batch: Dict[str, Any]) -> None:
     micro_batch.pop("source_name", None)
 
 
-def _run_eval_loss(model, eval_dataloader, eval_batches: int, enable_multisource: bool, model_fwd_context):
+def _run_eval_loss(
+    model,
+    eval_dataloader,
+    eval_batches: int,
+    enable_multisource: bool,
+    model_fwd_context,
+    model_config,
+):
     model.eval()
     total_eval_loss = 0.0
+    total_eval_ttt_output_delta_sample_ratio = 0.0
     evaluated_batches = 0
+    evaluated_ttt_monitor_batches = 0
     eval_iterator = iter(eval_dataloader)
+    monitor_logits_delta = getattr(model_config, "ttt_monitor_output_delta_target", "mlp") == "logits"
 
     with torch.no_grad():
         for _ in range(eval_batches):
@@ -264,6 +277,8 @@ def _run_eval_loss(model, eval_dataloader, eval_batches: int, enable_multisource
                 continue
 
             batch_loss = 0.0
+            batch_ttt_output_delta_sample_ratio = 0.0
+            has_ttt_output_delta_sample_ratio = False
             for micro_batch in micro_batches:
                 if enable_multisource:
                     _strip_multisource_fields(micro_batch)
@@ -272,16 +287,47 @@ def _run_eval_loss(model, eval_dataloader, eval_batches: int, enable_multisource
                     model_outputs = model(**micro_batch, use_cache=False)
                 length_in_micro_batch = torch.sum(micro_batch["labels"] != IGNORE_INDEX)
                 loss = model_outputs.loss * length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
+                loss_scale = length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
                 batch_loss += loss.item()
+                if monitor_logits_delta:
+                    with model_fwd_context:
+                        logits_delta_ratio = _compute_ttt_logits_delta_sample_ratio(
+                            model,
+                            micro_batch,
+                            sample_tokens=int(
+                                getattr(
+                                    model_config,
+                                    "ttt_monitor_logit_sample_tokens",
+                                    getattr(model_config, "ttt_monitor_sample_tokens", 1),
+                                )
+                            ),
+                            sample_dim=int(getattr(model_config, "ttt_monitor_logit_sample_dim", 0)),
+                        )
+                    if logits_delta_ratio is not None:
+                        batch_ttt_output_delta_sample_ratio += (
+                            logits_delta_ratio * loss_scale.detach()
+                        ).item()
+                        has_ttt_output_delta_sample_ratio = True
                 del micro_batch
 
             total_eval_loss += all_reduce(batch_loss, group=get_parallel_state().fsdp_group)
+            if has_ttt_output_delta_sample_ratio:
+                total_eval_ttt_output_delta_sample_ratio += all_reduce(
+                    batch_ttt_output_delta_sample_ratio,
+                    group=get_parallel_state().fsdp_group,
+                )
+                evaluated_ttt_monitor_batches += 1
             evaluated_batches += 1
 
     model.train()
     if evaluated_batches == 0:
         return None
-    return total_eval_loss / evaluated_batches
+    eval_metrics = {"loss": total_eval_loss / evaluated_batches}
+    if evaluated_ttt_monitor_batches > 0:
+        eval_metrics["ttt_output_delta_sample_ratio"] = (
+            total_eval_ttt_output_delta_sample_ratio / evaluated_ttt_monitor_batches
+        )
+    return eval_metrics
 
 
 def main():
@@ -375,6 +421,15 @@ def main():
         config_kwargs=args.model.foundation,
     )
     model_config = model.config
+    # HF from_pretrained silently drops kwargs that are not defined config attributes;
+    # fail fast if any foundation kwarg did not land on the model config.
+    if args.model.foundation:
+        dropped_foundation_keys = [key for key in args.model.foundation if not hasattr(model_config, key)]
+        if dropped_foundation_keys:
+            raise RuntimeError(
+                f"Foundation config kwargs {dropped_foundation_keys} were silently dropped because they are not "
+                "defined attributes of the model config. Define them in the config class before training."
+            )
     helper.print_device_mem_info("VRAM usage after building model")
 
     get_optimizer_pre_hook = getattr(model, "get_optimizer_pre_hook", None)
@@ -390,6 +445,12 @@ def main():
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
+
+    if bool(getattr(model_config, "ttt_train_only", False)):
+        trainable_params = _configure_ttt_only_trainable_params(model)
+        if trainable_params == 0:
+            raise RuntimeError("ttt_train_only is enabled, but no trainable TTT parameters were found.")
+        logger.info_rank0(f"TTT-only training enabled: trainable_params={trainable_params:,}")
 
     optimizer_param_groups = _build_ttt_optimizer_param_groups(
         model,
@@ -544,6 +605,9 @@ def main():
             total_main_loss = 0
             total_ttt_aux_loss = 0
             total_ttt_aux_raw_loss = 0
+            total_ttt_delta_weight_sample_ratio = 0
+            total_ttt_delta_weight_cumsum_sample_ratio = 0
+            total_ttt_output_delta_sample_ratio = 0
             synchronize()
             start_time = time.time()
 
@@ -569,7 +633,6 @@ def main():
 
                 with model_bwd_context:
                     raw_aux_loss = _get_last_ttt_aux_loss(model_outputs, model)
-                    loss.backward()
                     ttt_aux_weight = float(getattr(model_config, "ttt_aux_loss_weight", 0.0))
                     scaled_aux_loss = _accumulate_ttt_aux_grads(
                         model,
@@ -577,6 +640,8 @@ def main():
                         ttt_aux_weight,
                         loss_scale,
                     )
+                    loss.backward()
+                ttt_monitor_stats = _pop_ttt_monitor_stats(model)
 
                 main_loss_item = loss.item()
                 aux_loss_item = scaled_aux_loss.item() if scaled_aux_loss is not None else 0.0
@@ -588,6 +653,15 @@ def main():
                 total_main_loss += main_loss_item
                 total_ttt_aux_loss += aux_loss_item
                 total_ttt_aux_raw_loss += raw_aux_loss_item
+                total_ttt_delta_weight_sample_ratio += (
+                    ttt_monitor_stats.get("delta_weight_sample_ratio", loss.new_zeros(())) * loss_scale.detach()
+                ).item()
+                total_ttt_delta_weight_cumsum_sample_ratio += (
+                    ttt_monitor_stats.get("delta_weight_cumsum_sample_ratio", loss.new_zeros(())) * loss_scale.detach()
+                ).item()
+                total_ttt_output_delta_sample_ratio += (
+                    ttt_monitor_stats.get("output_delta_sample_ratio", loss.new_zeros(())) * loss_scale.detach()
+                ).item()
                 total_loss += main_loss_item + aux_loss_item
                 del micro_batch
 
@@ -600,8 +674,26 @@ def main():
                 grad_norm = grad_norm.full_tensor().item()
 
             # collect mean loss across data parallel group
-            total_loss, total_main_loss, total_ttt_aux_loss, total_ttt_aux_raw_loss, grad_norm = all_reduce(
-                (total_loss, total_main_loss, total_ttt_aux_loss, total_ttt_aux_raw_loss, grad_norm),
+            (
+                total_loss,
+                total_main_loss,
+                total_ttt_aux_loss,
+                total_ttt_aux_raw_loss,
+                total_ttt_delta_weight_sample_ratio,
+                total_ttt_delta_weight_cumsum_sample_ratio,
+                total_ttt_output_delta_sample_ratio,
+                grad_norm,
+            ) = all_reduce(
+                (
+                    total_loss,
+                    total_main_loss,
+                    total_ttt_aux_loss,
+                    total_ttt_aux_raw_loss,
+                    total_ttt_delta_weight_sample_ratio,
+                    total_ttt_delta_weight_cumsum_sample_ratio,
+                    total_ttt_output_delta_sample_ratio,
+                    grad_norm,
+                ),
                 group=get_parallel_state().fsdp_group,
             )
             synchronize()
@@ -612,6 +704,8 @@ def main():
             data_loader_tqdm.set_postfix_str(
                 f"loss: {total_loss:.4f}, main: {total_main_loss:.4f}, "
                 f"ttt_aux: {total_ttt_aux_loss:.4f}, ttt_aux_raw: {total_ttt_aux_raw_loss:.4f}, "
+                f"ttt_dw: {total_ttt_delta_weight_sample_ratio:.2e}, "
+                f"ttt_do: {total_ttt_output_delta_sample_ratio:.2e}, "
                 f"grad_norm: {grad_norm:.4f}, lr: {lr:.2e}",
                 refresh=False,
             )
@@ -619,19 +713,22 @@ def main():
 
             if args.train.global_rank == 0:
                 if args.train.use_wandb:
-                    train_metrics.update(
-                        {
-                            "training/loss": total_loss,
-                            "training/main_loss": total_main_loss,
-                            "training/ttt_aux_loss": total_ttt_aux_loss,
-                            "training/ttt_aux_raw_loss": total_ttt_aux_raw_loss,
-                            "training/ttt_aux_loss_weight": float(
-                                getattr(model_config, "ttt_aux_loss_weight", 0.0)
-                            ),
-                            "training/grad_norm": grad_norm,
-                            "training/lr": lr,
-                        }
-                    )
+                    train_metric_values = {
+                        "training/loss": total_loss,
+                        "training/main_loss": total_main_loss,
+                        "training/ttt_aux_loss": total_ttt_aux_loss,
+                        "training/ttt_aux_raw_loss": total_ttt_aux_raw_loss,
+                        "training/ttt_delta_weight_sample_ratio": total_ttt_delta_weight_sample_ratio,
+                        "training/ttt_delta_weight_cumsum_sample_ratio": total_ttt_delta_weight_cumsum_sample_ratio,
+                        "training/ttt_aux_loss_weight": float(getattr(model_config, "ttt_aux_loss_weight", 0.0)),
+                        "training/grad_norm": grad_norm,
+                        "training/lr": lr,
+                    }
+                    if getattr(model_config, "ttt_monitor_output_delta_target", "mlp") == "mlp":
+                        train_metric_values["training/ttt_output_delta_sample_ratio"] = (
+                            total_ttt_output_delta_sample_ratio
+                        )
+                    train_metrics.update(train_metric_values)
                     wandb.log(train_metrics, step=global_step)
 
             if eval_dataloader is not None and should_run_eval(
@@ -640,17 +737,24 @@ def main():
                 args.train.eval_batches,
                 global_step,
             ):
-                eval_loss = _run_eval_loss(
+                eval_metrics = _run_eval_loss(
                     model,
                     eval_dataloader,
                     args.train.eval_batches,
                     eval_enable_multisource,
                     model_fwd_context,
+                    model_config,
                 )
-                if eval_loss is not None and args.train.global_rank == 0:
+                if eval_metrics is not None and args.train.global_rank == 0:
+                    eval_loss = eval_metrics["loss"]
                     logger.info_rank0(f"Eval loss at global_step {global_step}: {eval_loss:.4f}")
+                    if "ttt_output_delta_sample_ratio" in eval_metrics:
+                        logger.info_rank0(
+                            "Eval TTT output delta sample ratio at global_step "
+                            f"{global_step}: {eval_metrics['ttt_output_delta_sample_ratio']:.4e}"
+                        )
                     if args.train.use_wandb:
-                        wandb.log({"eval/loss": eval_loss}, step=global_step)
+                        wandb.log({f"eval/{key}": value for key, value in eval_metrics.items()}, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
                 profiler.step()

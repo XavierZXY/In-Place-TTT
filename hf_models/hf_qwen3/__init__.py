@@ -25,8 +25,12 @@ AutoConfig.register("qwen3", Qwen3Config, exist_ok=True)
 AutoModel.register(Qwen3Config, Qwen3Model, exist_ok=True)
 AutoModelForCausalLM.register(Qwen3Config, Qwen3ForCausalLM, exist_ok=True)
 
+_qwen3_forward = Qwen3ForCausalLM.forward
+
 
 def _qwen3_lce_forward_with_ttt_aux(self, *args, **kwargs):
+    if not self.lm_head.weight.is_cuda:
+        return _qwen3_forward(self, *args, **kwargs)
     out = qwen3_lce_forward(self, *args, **kwargs)
     aux = getattr(self.model, "_last_ttt_aux_loss", None)
     if hasattr(out, "__dict__"):

@@ -190,10 +190,20 @@ class Qwen3Config(PretrainedConfig):
         ttt_target="hidden_states",
         ttt_compress_window=0,
         ttt_aux_loss_weight=0.0,
+        ttt_aux_target="next_input_embed",
+        ttt_aux_future_chunks=1,
         ttt_aux_loss_type="jepa",
         ttt_jepa_loss_exp=1.0,
         ttt_jepa_reg_coeff=0.0,
         ttt_jepa_reg_eps=0.0001,
+        ttt_train_only=False,
+        ttt_param_lr_multiplier=1.0,
+        ttt_param_weight_decay=None,
+        ttt_monitor_sample_dim=64,
+        ttt_monitor_sample_tokens=1,
+        ttt_monitor_output_delta_target="mlp",
+        ttt_monitor_logit_sample_tokens=1,
+        ttt_monitor_logit_sample_dim=0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -255,6 +265,15 @@ class Qwen3Config(PretrainedConfig):
         self.ttt_aux_loss_weight = float(ttt_aux_loss_weight)
         if self.ttt_aux_loss_weight < 0:
             raise ValueError(f"ttt_aux_loss_weight must be >= 0, got {self.ttt_aux_loss_weight}")
+        self.ttt_aux_target = str(ttt_aux_target)
+        if self.ttt_aux_target not in {"next_input_embed", "future_chunk_hidden"}:
+            raise ValueError(
+                "ttt_aux_target must be one of {'next_input_embed', 'future_chunk_hidden'}, "
+                f"got {self.ttt_aux_target!r}"
+            )
+        self.ttt_aux_future_chunks = int(ttt_aux_future_chunks)
+        if self.ttt_aux_future_chunks < 1:
+            raise ValueError(f"ttt_aux_future_chunks must be >= 1, got {self.ttt_aux_future_chunks}")
         self.ttt_aux_loss_type = str(ttt_aux_loss_type)
         if self.ttt_aux_loss_type not in {"jepa", "cosine"}:
             raise ValueError(
@@ -270,6 +289,33 @@ class Qwen3Config(PretrainedConfig):
         self.ttt_jepa_reg_eps = float(ttt_jepa_reg_eps)
         if self.ttt_jepa_reg_eps < 0:
             raise ValueError(f"ttt_jepa_reg_eps must be >= 0, got {self.ttt_jepa_reg_eps}")
+        self.ttt_train_only = bool(ttt_train_only)
+        self.ttt_param_lr_multiplier = float(ttt_param_lr_multiplier)
+        if self.ttt_param_lr_multiplier <= 0:
+            raise ValueError(f"ttt_param_lr_multiplier must be > 0, got {self.ttt_param_lr_multiplier}")
+        self.ttt_param_weight_decay = None if ttt_param_weight_decay is None else float(ttt_param_weight_decay)
+        if self.ttt_param_weight_decay is not None and self.ttt_param_weight_decay < 0:
+            raise ValueError(f"ttt_param_weight_decay must be >= 0, got {self.ttt_param_weight_decay}")
+        self.ttt_monitor_sample_dim = int(ttt_monitor_sample_dim)
+        if self.ttt_monitor_sample_dim < 0:
+            raise ValueError(f"ttt_monitor_sample_dim must be >= 0, got {self.ttt_monitor_sample_dim}")
+        self.ttt_monitor_sample_tokens = int(ttt_monitor_sample_tokens)
+        if self.ttt_monitor_sample_tokens < 0:
+            raise ValueError(f"ttt_monitor_sample_tokens must be >= 0, got {self.ttt_monitor_sample_tokens}")
+        self.ttt_monitor_output_delta_target = str(ttt_monitor_output_delta_target)
+        if self.ttt_monitor_output_delta_target not in {"mlp", "logits"}:
+            raise ValueError(
+                "ttt_monitor_output_delta_target must be one of {'mlp', 'logits'}, "
+                f"got {self.ttt_monitor_output_delta_target!r}"
+            )
+        self.ttt_monitor_logit_sample_tokens = int(ttt_monitor_logit_sample_tokens)
+        if self.ttt_monitor_logit_sample_tokens < 0:
+            raise ValueError(
+                f"ttt_monitor_logit_sample_tokens must be >= 0, got {self.ttt_monitor_logit_sample_tokens}"
+            )
+        self.ttt_monitor_logit_sample_dim = int(ttt_monitor_logit_sample_dim)
+        if self.ttt_monitor_logit_sample_dim < 0:
+            raise ValueError(f"ttt_monitor_logit_sample_dim must be >= 0, got {self.ttt_monitor_logit_sample_dim}")
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,

@@ -1,12 +1,12 @@
 #!/bin/bash
-# Generic LongSFT launcher template.
+# Generic pretrain launcher template. Data-specific wrappers should only set defaults.
 
 set -euo pipefail
 if [[ "${TRACE:-1}" == "1" ]]; then
   set -x
 fi
 
-CONFIG="${CONFIG:-configs/pretrain/qwen3_longsft_swa_full_1to3_ttt_aux.yaml}"
+CONFIG="${CONFIG:-configs/pretrain/qwen3_swa3_full1_v0anchor_ttt_aux_c2048.yaml}"
 TASK_SCRIPT="${TASK_SCRIPT:-tasks/train_torch.py}"
 
 config_base="${CONFIG##*/}"
@@ -77,7 +77,14 @@ append_runtime_arg() {
 append_runtime_arg "${USE_WANDB:-}" --train.use_wandb
 append_runtime_arg "${TRAIN_PATH:-}" --data.train_path
 append_runtime_arg "${EVAL_PATH:-}" --data.eval_path
+append_runtime_arg "${EVAL_DATASETS_TYPE:-}" --data.eval_datasets_type
+append_runtime_arg "${DATALOADER_TYPE:-}" --data.dataloader_type
+append_runtime_arg "${DATASETS_TYPE:-}" --data.datasets_type
+append_runtime_arg "${DATA_TYPE:-}" --data.data_type
+append_runtime_arg "${CHAT_TEMPLATE:-}" --data.chat_template
 append_runtime_arg "${MAX_SEQ_LEN:-}" --data.max_seq_len
+append_runtime_arg "${TEXT_KEYS:-}" --data.text_keys
+append_runtime_arg "${TRAIN_SIZE:-}" --data.train_size
 append_runtime_arg "${MAX_STEPS:-}" --train.max_steps
 append_runtime_arg "${SAVE_STEPS:-}" --train.save_steps
 append_runtime_arg "${EVAL_STEPS:-}" --train.eval_steps
@@ -85,6 +92,12 @@ append_runtime_arg "${EVAL_BATCHES:-}" --train.eval_batches
 append_runtime_arg "${GLOBAL_BATCH_SIZE:-}" --train.global_batch_size
 append_runtime_arg "${MICRO_BATCH_SIZE:-}" --train.micro_batch_size
 append_runtime_arg "${LR:-}" --train.lr
+append_runtime_arg "${LR_MIN:-}" --train.lr_min
+append_runtime_arg "${LR_WARMUP_RATIO:-}" --train.lr_warmup_ratio
+append_runtime_arg "${LR_DECAY_STYLE:-}" --train.lr_decay_style
+append_runtime_arg "${LR_DECAY_RATIO:-}" --train.lr_decay_ratio
+append_runtime_arg "${WEIGHT_DECAY:-}" --train.weight_decay
+append_runtime_arg "${MAX_GRAD_NORM:-}" --train.max_grad_norm
 if [[ "${LOAD_CHECKPOINT_PATH+x}" == "x" ]]; then
   runtime_args+=(--train.load_checkpoint_path "$LOAD_CHECKPOINT_PATH")
 fi
@@ -107,15 +120,41 @@ append_foundation_raw() {
   fi
 }
 
+append_foundation_string() {
+  local key="$1"
+  local value="$2"
+  if [[ -n "$value" ]]; then
+    foundation_items+=("\"$key\": \"$value\"")
+  fi
+}
+
 append_foundation_raw "ttt_chunk" "${TTT_CHUNK:-}"
 append_foundation_raw "ttt_compress_window" "${TTT_COMPRESS_WINDOW:-}"
 append_foundation_raw "ttt_lr" "${TTT_LR:-}"
 append_foundation_raw "ttt_aux_loss_weight" "${TTT_AUX_LOSS_WEIGHT:-}"
+append_foundation_string "ttt_target" "${TTT_TARGET:-}"
+append_foundation_string "ttt_aux_target" "${TTT_AUX_TARGET:-}"
+append_foundation_raw "ttt_aux_future_chunks" "${TTT_AUX_FUTURE_CHUNKS:-}"
+append_foundation_string "ttt_aux_loss_type" "${TTT_AUX_LOSS_TYPE:-}"
+append_foundation_raw "ttt_jepa_loss_exp" "${TTT_JEPA_LOSS_EXP:-}"
+append_foundation_raw "ttt_jepa_reg_coeff" "${TTT_JEPA_REG_COEFF:-}"
+append_foundation_raw "ttt_monitor_sample_dim" "${TTT_MONITOR_SAMPLE_DIM:-}"
+append_foundation_raw "ttt_monitor_sample_tokens" "${TTT_MONITOR_SAMPLE_TOKENS:-}"
+append_foundation_string "ttt_monitor_output_delta_target" "${TTT_MONITOR_OUTPUT_DELTA_TARGET:-}"
+append_foundation_raw "ttt_monitor_logit_sample_tokens" "${TTT_MONITOR_LOGIT_SAMPLE_TOKENS:-}"
+append_foundation_raw "ttt_monitor_logit_sample_dim" "${TTT_MONITOR_LOGIT_SAMPLE_DIM:-}"
 append_foundation_raw "ttt_param_lr_multiplier" "${TTT_PARAM_LR_MULTIPLIER:-}"
 append_foundation_raw "ttt_param_weight_decay" "${TTT_PARAM_WEIGHT_DECAY:-}"
+append_foundation_raw "ttt_train_only" "${TTT_TRAIN_ONLY:-}"
 append_foundation_raw "ttt_mode" "${TTT_MODE:-}"
 append_foundation_raw "ttt_layers" "${TTT_LAYERS:-}"
 append_foundation_raw "full_attention_layers" "${FULL_ATTENTION_LAYERS:-}"
+append_foundation_string "distill_teacher_path" "${DISTILL_TEACHER_PATH:-}"
+append_foundation_string "hidden_align_teacher_path" "${HIDDEN_ALIGN_TEACHER_PATH:-}"
+append_foundation_string "hidden_align_loss_fn" "${HIDDEN_ALIGN_LOSS_FN:-}"
+append_foundation_raw "hidden_align_layers" "${HIDDEN_ALIGN_LAYERS:-}"
+append_foundation_raw "hidden_align_skip_ttt_layers" "${HIDDEN_ALIGN_SKIP_TTT_LAYERS:-}"
+append_foundation_string "hidden_align_train_scope" "${HIDDEN_ALIGN_TRAIN_SCOPE:-}"
 
 foundation_override="${MODEL_FOUNDATION_JSON:-}"
 if [[ -z "$foundation_override" && "${#foundation_items[@]}" -gt 0 ]]; then

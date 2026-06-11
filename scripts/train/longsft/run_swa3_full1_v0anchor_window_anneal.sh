@@ -1,38 +1,20 @@
 #!/bin/bash
 # Progressive SWA window annealing for Full:SWA = 1:3 + TTT on SWA layers.
 
-set -x
-set -e
-set -o pipefail
+set -euo pipefail
 
-CONFIG="configs/pretrain/qwen3_longsft_swa_full_1to3_ttt_aux.yaml"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+CONFIG="${CONFIG:-configs/pretrain/qwen3_swa3_full1_v0anchor_ttt_aux_c2048.yaml}"
+EXP_NAME="${EXP_NAME:-qwen3-swa3-full1-v0anchor-window-anneal}"
 WANDB_PROJECT="${WANDB_PROJECT:-in-place-ttt}"
-WANDB_NAME="${WANDB_NAME:-longsft-full-swa-1to3-swa-ttt-progressive-window-anneal}"
+WANDB_NAME="${WANDB_NAME:-$EXP_NAME}"
 TOTAL_STEPS="${TOTAL_STEPS:-4000}"
 WINDOW_SCHEDULE="${WINDOW_SCHEDULE:-4096,2048,1024}"
 STAGE_STOP_STEPS="${STAGE_STOP_STEPS:-400,800}"
-OUTPUT_BASE="${OUTPUT_BASE:-/zouxiangyu/codes/Learning/In-Place-TTT/outputs/longsft-full-swa-1to3-swa-ttt-progressive-window-anneal}"
-
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export TOKENIZERS_PARALLELISM=false
-export TORCH_NCCL_AVOID_RECORD_STREAMS=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-cd "$REPO_ROOT"
-export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-
-NPROC_PER_NODE="${MLP_GPU:-8}"
-NNODES="${MLP_WORKER_NUM:-1}"
-NODE_RANK="${MLP_ROLE_INDEX:-0}"
-MASTER_ADDR="${MLP_WORKER_0_HOST:-localhost}"
-MASTER_PORT="${MLP_WORKER_0_PORT:-12361}"
-
-if [[ "$NNODES" == "1" ]]; then
-  additional_args="--standalone"
-fi
+OUTPUT_BASE="${OUTPUT_BASE:-outputs/$EXP_NAME}"
+MASTER_PORT="${MASTER_PORT:-12361}"
+NODE_RANK="${NODE_RANK:-${MLP_ROLE_INDEX:-0}}"
 
 IFS=',' read -r -a WINDOWS <<< "$WINDOW_SCHEDULE"
 IFS=',' read -r -a STOP_STEPS <<< "$STAGE_STOP_STEPS"
@@ -56,21 +38,20 @@ run_stage() {
   local window_size="$2"
   local output_dir="$3"
   local log_file="$4"
-  shift 4
+  local load_checkpoint_path="$5"
+  shift 5
 
-  torchrun \
-    --nproc_per_node "$NPROC_PER_NODE" \
-    --nnodes "$NNODES" \
-    --node_rank "$NODE_RANK" \
-    --master_addr "$MASTER_ADDR" \
-    --master_port "$MASTER_PORT" \
-    $additional_args tasks/train_torch.py "$CONFIG" \
-    --model.foundation "{\"ttt_compress_window\": ${window_size}}" \
-    --train.output_dir "$output_dir" \
-    --train.max_steps "$TOTAL_STEPS" \
-    --train.wandb_project "$WANDB_PROJECT" \
-    --train.wandb_name "${WANDB_NAME}-${stage_name}-w${window_size}" \
-    "$@" 2>&1 | tee "$log_file"
+  CONFIG="$CONFIG" \
+  EXP_NAME="${EXP_NAME}-${stage_name}-w${window_size}" \
+  OUTPUT_DIR="$output_dir" \
+  WANDB_PROJECT="$WANDB_PROJECT" \
+  WANDB_NAME="${WANDB_NAME}-${stage_name}-w${window_size}" \
+  LOG_FILE="$log_file" \
+  MASTER_PORT="$MASTER_PORT" \
+  MAX_STEPS="$TOTAL_STEPS" \
+  LOAD_CHECKPOINT_PATH="$load_checkpoint_path" \
+  TTT_COMPRESS_WINDOW="$window_size" \
+    bash "$SCRIPT_DIR/run_pretrain_template.sh" "$@"
 }
 
 previous_ckpt=""
@@ -83,9 +64,9 @@ for stage_index in "${!WINDOWS[@]}"; do
   output_dir="${OUTPUT_BASE}/${stage_name}-w${window_size}"
   log_file="./logs/log-${WANDB_NAME}-${stage_name}-w${window_size}_node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).txt"
 
-  load_args=(--train.load_checkpoint_path "auto")
+  load_checkpoint_path="auto"
   if [[ -n "$previous_ckpt" ]]; then
-    load_args=(--train.load_checkpoint_path "$previous_ckpt")
+    load_checkpoint_path="$previous_ckpt"
   fi
 
   stop_args=()
@@ -99,7 +80,7 @@ for stage_index in "${!WINDOWS[@]}"; do
     "$window_size" \
     "$output_dir" \
     "$log_file" \
-    "${load_args[@]}" \
+    "$load_checkpoint_path" \
     "${stop_args[@]}" \
     "$@"
 

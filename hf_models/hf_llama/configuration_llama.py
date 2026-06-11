@@ -193,6 +193,11 @@ class LlamaConfig(PretrainedConfig):
         ttt_lr=0.3,
         ttt_chunk=8192,
         ttt_target="hidden_states",
+        ttt_monitor_sample_dim=64,
+        ttt_monitor_sample_tokens=1,
+        ttt_monitor_output_delta_target="mlp",
+        ttt_monitor_logit_sample_tokens=1,
+        ttt_monitor_logit_sample_dim=0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -227,6 +232,26 @@ class LlamaConfig(PretrainedConfig):
         self.ttt_target = ttt_target
         if self.ttt_target not in {"hidden_states", "input_embed"}:
             raise ValueError("ttt_target must be one of {'hidden_states', 'input_embed'}")
+        self.ttt_monitor_sample_dim = int(ttt_monitor_sample_dim)
+        if self.ttt_monitor_sample_dim < 0:
+            raise ValueError(f"ttt_monitor_sample_dim must be >= 0, got {self.ttt_monitor_sample_dim}")
+        self.ttt_monitor_sample_tokens = int(ttt_monitor_sample_tokens)
+        if self.ttt_monitor_sample_tokens < 0:
+            raise ValueError(f"ttt_monitor_sample_tokens must be >= 0, got {self.ttt_monitor_sample_tokens}")
+        self.ttt_monitor_output_delta_target = str(ttt_monitor_output_delta_target)
+        if self.ttt_monitor_output_delta_target not in {"mlp", "logits"}:
+            raise ValueError(
+                "ttt_monitor_output_delta_target must be one of {'mlp', 'logits'}, "
+                f"got {self.ttt_monitor_output_delta_target!r}"
+            )
+        self.ttt_monitor_logit_sample_tokens = int(ttt_monitor_logit_sample_tokens)
+        if self.ttt_monitor_logit_sample_tokens < 0:
+            raise ValueError(
+                f"ttt_monitor_logit_sample_tokens must be >= 0, got {self.ttt_monitor_logit_sample_tokens}"
+            )
+        self.ttt_monitor_logit_sample_dim = int(ttt_monitor_logit_sample_dim)
+        if self.ttt_monitor_logit_sample_dim < 0:
+            raise ValueError(f"ttt_monitor_logit_sample_dim must be >= 0, got {self.ttt_monitor_logit_sample_dim}")
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, copy it it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:

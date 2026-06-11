@@ -4,7 +4,7 @@
 set -x
 set -o pipefail
 
-CONFIG="configs/pretrain/qwen3_coding_full_swa_ttt_aux.yaml"
+CONFIG="configs/pretrain/qwen3_swa1024_ttt_aux_low_lr.yaml"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export TOKENIZERS_PARALLELISM=false
@@ -27,7 +27,7 @@ if [[ "$NNODES" == "1" ]]; then
   additional_args="--standalone"
 fi
 
-LOG_FILE="./logs/log-longsft-swa-ttt-aux-amp_node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).txt"
+LOG_FILE="./logs/log-qwen3-swa1024-ttt-aux-low-lr-c256-24k_node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).txt"
 
 torchrun \
   --nproc_per_node "$NPROC_PER_NODE" \

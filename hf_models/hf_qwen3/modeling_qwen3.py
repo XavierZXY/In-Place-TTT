@@ -131,36 +131,109 @@ class Qwen3MLP(nn.Module):
             v_hat = t_conv
         return rearrange(v_hat, "b t c d -> b (t c) d")[:, :seq_len, :]
 
+    def _record_ttt_monitor_stats(
+        self,
+        delta_down_proj: torch.Tensor,
+        h_padded: torch.Tensor,
+        down_proj: torch.Tensor,
+    ) -> None:
+        if delta_down_proj.shape[1] == 0:
+            self._last_ttt_monitor_stats = None
+            return
+
+        sample_dim = min(int(getattr(self.config, "ttt_monitor_sample_dim", 64)), delta_down_proj.shape[-2])
+        sample_tokens = min(int(getattr(self.config, "ttt_monitor_sample_tokens", 1)), h_padded.shape[-2])
+        if sample_dim <= 0 or sample_tokens <= 0:
+            self._last_ttt_monitor_stats = None
+            return
+
+        with torch.no_grad():
+            eps = torch.tensor(1e-12, device=down_proj.device, dtype=torch.float32)
+            base_weight_sample = self.down_proj.weight[:sample_dim].detach().float()
+            base_weight_norm = base_weight_sample.norm().clamp_min(eps)
+
+            delta_sample = delta_down_proj[:, :, :sample_dim, :].detach().float()
+            delta_weight_ratio = delta_sample.norm(dim=(-2, -1)).mean() / base_weight_norm
+            delta_weight_cumsum_ratio = delta_sample.cumsum(dim=1).norm(dim=(-2, -1)).mean() / base_weight_norm
+
+            h_sample = h_padded[:, :, :sample_tokens, :].detach().float()
+            output_sample = down_proj[:, :, :sample_tokens, :sample_dim].detach().float()
+            base_output_sample = contract("d h, b t c h -> b t c d", base_weight_sample, h_sample)
+            output_delta_ratio = (output_sample - base_output_sample).norm() / output_sample.norm().clamp_min(eps)
+
+            self._last_ttt_monitor_stats = {
+                "delta_weight_sample_ratio": delta_weight_ratio.detach(),
+                "delta_weight_cumsum_sample_ratio": delta_weight_cumsum_ratio.detach(),
+                "output_delta_sample_ratio": output_delta_ratio.detach(),
+            }
+
+    def _record_ttt_future_chunk_aux(
+        self,
+        prediction_states: torch.Tensor,
+        target_states: torch.Tensor,
+        seq_len: int,
+    ) -> None:
+        self._last_ttt_aux_prediction = None
+        self._last_ttt_aux_target = None
+
+        if (
+            not self.training
+            or float(getattr(self.config, "ttt_aux_loss_weight", 0.0)) <= 0.0
+            or getattr(self.config, "ttt_aux_target", "next_input_embed") != "future_chunk_hidden"
+        ):
+            return
+
+        future_chunks = int(getattr(self.config, "ttt_aux_future_chunks", 1))
+        if future_chunks < 1 or prediction_states.shape[1] <= future_chunks:
+            return
+
+        _, chunk_num, chunk_size, _ = prediction_states.shape
+        valid_tokens = torch.arange(
+            chunk_num * chunk_size,
+            device=prediction_states.device,
+        ) < seq_len
+        valid_tokens = valid_tokens.view(1, chunk_num, chunk_size, 1)
+        valid_tokens = valid_tokens.to(dtype=prediction_states.dtype)
+        denom = valid_tokens.sum(dim=2).clamp_min(1.0)
+
+        prediction_pool = (prediction_states * valid_tokens).sum(dim=2) / denom
+        target_pool = (target_states.detach() * valid_tokens).sum(dim=2) / denom
+        self._last_ttt_aux_prediction = prediction_pool[:, :-future_chunks, :]
+        self._last_ttt_aux_target = target_pool[:, future_chunks:, :]
+
     def forward(self, x, t: Optional[torch.Tensor] = None):  # TTT: added t param
         h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         # TTT: branch on whether this is a TTT layer with target states
         if t is None or not hasattr(self, "ttt_conv"):
+            self._last_ttt_aux_prediction = None
+            self._last_ttt_aux_target = None
             return self.down_proj(h)
         # TTT path
-        t = self.padding(t)
+        target_padded = self.padding(t)
         h_padded = self.padding(h)
-        bs, chunk_num, chunk_size, _ = t.shape
-        t = (
-            self.ttt_conv(t.transpose(-1, -2).reshape(bs * chunk_num, -1, chunk_size))
+        bs, chunk_num, chunk_size, _ = target_padded.shape
+        t_conv = (
+            self.ttt_conv(target_padded.transpose(-1, -2).reshape(bs * chunk_num, -1, chunk_size))
             .transpose(-1, -2)
             .reshape(bs, chunk_num, chunk_size, -1)
         )
         if self.ttt_proj is not None:
-            d_down_proj = contract(
-                "b t c h, b t c d, d e -> b t e h",
-                h_padded[:, :-1], t[:, :-1], self.ttt_proj.weight,
-            )
+            prediction_states = contract("b t c d, d e -> b t c e", t_conv, self.ttt_proj.weight)
         else:
-            d_down_proj = contract(
-                "b t c h, b t c d -> b t d h",
-                h_padded[:, :-1], t[:, :-1],
-            )
+            prediction_states = t_conv
+        d_down_proj = contract(
+            "b t c h, b t c d -> b t d h",
+            h_padded[:, :-1], prediction_states[:, :-1],
+        )
+        delta_down_proj = d_down_proj * self.ttt_lr
         d_down_proj = torch.cat(
-            [repeat(self.down_proj.weight, "d h -> b 1 d h", b=bs), d_down_proj * self.ttt_lr],
+            [repeat(self.down_proj.weight, "d h -> b 1 d h", b=bs), delta_down_proj],
             dim=1,
         )
         d_down_proj_sum = d_down_proj.cumsum(dim=1)
         down_proj = contract("b t d h, b t c h -> b t c d", d_down_proj_sum, h_padded)
+        self._record_ttt_future_chunk_aux(prediction_states, target_padded, x.shape[1])
+        self._record_ttt_monitor_stats(delta_down_proj, h_padded, down_proj)
         return rearrange(down_proj, "b t c d -> b (t c) d")[:, : x.shape[1], :]
 
 
@@ -578,23 +651,60 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        ttt_aux_loss_weight = float(getattr(self.config, "ttt_aux_loss_weight", 0.0))
+        ttt_aux_target = getattr(self.config, "ttt_aux_target", "next_input_embed")
+        collect_future_chunk_aux = self.training and ttt_aux_loss_weight > 0.0 and self.ttt_mode and (
+            ttt_aux_target == "future_chunk_hidden"
+        )
+        future_chunk_predictions = []
+        future_chunk_targets = []
+
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                target_states=self._resolve_ttt_target_states(decoder_layer, inputs_embeds),
-                **kwargs,
-            )
+            collect_layer_aux = collect_future_chunk_aux and decoder_layer.is_ttt_layer
+            saved_ckpt = getattr(decoder_layer, "gradient_checkpointing", False)
+            if collect_layer_aux:
+                decoder_layer.gradient_checkpointing = False
+            try:
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    target_states=self._resolve_ttt_target_states(decoder_layer, inputs_embeds),
+                    **kwargs,
+                )
+            finally:
+                if collect_layer_aux:
+                    decoder_layer.gradient_checkpointing = saved_ckpt
+
+            if collect_layer_aux:
+                prediction = getattr(decoder_layer.mlp, "_last_ttt_aux_prediction", None)
+                target = getattr(decoder_layer.mlp, "_last_ttt_aux_target", None)
+                if prediction is not None and target is not None:
+                    future_chunk_predictions.append(prediction)
+                    future_chunk_targets.append(target)
 
         hidden_states = self.norm(hidden_states)
-        ttt_aux_loss_weight = float(getattr(self.config, "ttt_aux_loss_weight", 0.0))
         ttt_aux_loss = None
-        if self.training and ttt_aux_loss_weight > 0.0 and self.ttt_mode and self.ttt_target == "input_embed":
+        if collect_future_chunk_aux and future_chunk_predictions:
+            ttt_aux_loss = compute_ttt_aux_loss(
+                future_chunk_predictions,
+                future_chunk_targets,
+                loss_type=getattr(self.config, "ttt_aux_loss_type", "jepa"),
+                loss_exp=float(getattr(self.config, "ttt_jepa_loss_exp", 1.0)),
+                reg_coeff=float(getattr(self.config, "ttt_jepa_reg_coeff", 0.0)),
+                reg_eps=float(getattr(self.config, "ttt_jepa_reg_eps", 0.0001)),
+            )
+        elif (
+            self.training
+            and ttt_aux_loss_weight > 0.0
+            and self.ttt_mode
+            and self.ttt_target == "input_embed"
+            and ttt_aux_target == "next_input_embed"
+        ):
             seq_len = inputs_embeds.shape[1]
             if seq_len > 1:
                 emb_for_aux = inputs_embeds.detach()
