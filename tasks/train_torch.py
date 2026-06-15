@@ -104,6 +104,13 @@ class EvalDataArguments(DataArguments):
         default="mapping",
         metadata={"help": "Dataset type for held-out eval data."},
     )
+    eval_max_seq_len: int | None = field(
+        default=None,
+        metadata={
+            "help": "Eval sequence length; defaults to max_seq_len. "
+            "Set above max_seq_len to measure length extrapolation."
+        },
+    )
 
 
 @dataclass
@@ -216,6 +223,7 @@ def _args_for_eval(args):
     eval_args.data = copy.copy(args.data)
     eval_args.data.train_path = args.data.eval_path
     eval_args.data.datasets_type = args.data.eval_datasets_type
+    eval_args.data.max_seq_len = args.data.eval_max_seq_len or args.data.max_seq_len
     eval_args.data.enable_multisource = str(args.data.eval_path).endswith(".yaml")
     eval_args.data.dataset_name = (
         eval_args.data.multisource_datasets_type if eval_args.data.enable_multisource else args.data.eval_datasets_type
@@ -253,7 +261,10 @@ def _run_eval_loss(
     enable_multisource: bool,
     model_fwd_context,
     model_config,
+    bucket_boundaries=None,
 ):
+    from tasks.position_lm_metrics import PositionBucketMeter, per_token_lm_loss
+
     model.eval()
     total_eval_loss = 0.0
     total_eval_ttt_output_delta_sample_ratio = 0.0
@@ -261,6 +272,7 @@ def _run_eval_loss(
     evaluated_ttt_monitor_batches = 0
     eval_iterator = iter(eval_dataloader)
     monitor_logits_delta = getattr(model_config, "ttt_monitor_output_delta_target", "mlp") == "logits"
+    bucket_meter = PositionBucketMeter(bucket_boundaries) if bucket_boundaries else None
 
     with torch.no_grad():
         for _ in range(eval_batches):
@@ -289,6 +301,8 @@ def _run_eval_loss(
                 loss = model_outputs.loss * length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
                 loss_scale = length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
                 batch_loss += loss.item()
+                if bucket_meter is not None and getattr(model_outputs, "logits", None) is not None:
+                    bucket_meter.add(*per_token_lm_loss(model_outputs.logits, micro_batch["labels"]))
                 if monitor_logits_delta:
                     with model_fwd_context:
                         logits_delta_ratio = _compute_ttt_logits_delta_sample_ratio(
@@ -326,6 +340,13 @@ def _run_eval_loss(
     if evaluated_ttt_monitor_batches > 0:
         eval_metrics["ttt_output_delta_sample_ratio"] = (
             total_eval_ttt_output_delta_sample_ratio / evaluated_ttt_monitor_batches
+        )
+    if bucket_meter is not None:
+        eval_metrics.update(
+            {
+                f"lm_loss_pos/{label}": value
+                for label, value in bucket_meter.reduced_means(all_reduce, get_parallel_state().fsdp_group).items()
+            }
         )
     return eval_metrics
 
@@ -371,30 +392,33 @@ def main():
 
     logger.info_rank0("Prepare data")
     tokenizer = build_tokenizer(args.model.tokenizer_path)
-    if args.data.data_type == "plaintext":
-        transform = partial(
-            process_pretrain_example,
-            tokenizer=tokenizer,
-            max_seq_len=args.data.max_seq_len,
-            text_keys=args.data.text_keys,
-        )
-    elif args.data.data_type == "conversation":
-        chat_template = build_chat_template(args.data.chat_template, tokenizer)
-        transform = partial(
-            process_sft_example,
-            chat_template=chat_template,
-            max_seq_len=args.data.max_seq_len,
-            text_keys=args.data.text_keys,
-        )
-    elif args.data.data_type == "pretokenized":
-        if process_pretokenized_example is None:
-            raise NotImplementedError("Installed veomni package does not provide `process_pretokenized_example`.")
-        transform = partial(
-            process_pretokenized_example,
-            input_ids_key=args.data.text_keys,  # text_keys is used as input_ids_key for pretokenized
-        )
-    else:
-        raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
+
+    def build_transform_for(data_args):
+        if data_args.data_type == "plaintext":
+            return partial(
+                process_pretrain_example,
+                tokenizer=tokenizer,
+                max_seq_len=data_args.max_seq_len,
+                text_keys=data_args.text_keys,
+            )
+        if data_args.data_type == "conversation":
+            chat_template = build_chat_template(data_args.chat_template, tokenizer)
+            return partial(
+                process_sft_example,
+                chat_template=chat_template,
+                max_seq_len=data_args.max_seq_len,
+                text_keys=data_args.text_keys,
+            )
+        if data_args.data_type == "pretokenized":
+            if process_pretokenized_example is None:
+                raise NotImplementedError("Installed veomni package does not provide `process_pretokenized_example`.")
+            return partial(
+                process_pretokenized_example,
+                input_ids_key=data_args.text_keys,  # text_keys is used as input_ids_key for pretokenized
+            )
+        raise NotImplementedError(f"Unsupported data type: {data_args.data_type}.")
+
+    transform = build_transform_for(args.data)
 
     train_dataset = _build_dataset_for_args(args, transform)
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
@@ -404,10 +428,14 @@ def main():
     train_dataloader = _build_dataloader_compat(args, train_dataset, train_steps)
     eval_dataloader = None
     eval_enable_multisource = False
+    eval_max_seq_len = args.data.eval_max_seq_len or args.data.max_seq_len
     if args.data.eval_path and args.train.eval_steps > 0 and args.train.eval_batches > 0:
         eval_args = _args_for_eval(args)
         eval_enable_multisource = eval_args.data.enable_multisource
-        eval_dataset = _build_dataset_for_args(eval_args, transform)
+        # Eval may run at a longer sequence length than training to measure
+        # length extrapolation, so it gets its own transform.
+        eval_transform = build_transform_for(eval_args.data)
+        eval_dataset = _build_dataset_for_args(eval_args, eval_transform)
         eval_dataloader = _build_dataloader_compat(eval_args, eval_dataset, args.train.eval_batches)
 
     logger.info_rank0("Prepare model")
@@ -503,7 +531,7 @@ def main():
         if args.data.data_type in ["plaintext", "pretokenized"]:
             model_assets = [model_config, tokenizer]
         else:
-            model_assets = [model_config, chat_template]
+            model_assets = [model_config, build_chat_template(args.data.chat_template, tokenizer)]
         save_model_assets(args.train.model_assets_dir, model_assets)
 
     if args.train.profile_this_rank:
@@ -577,6 +605,15 @@ def main():
         f"rank{args.train.local_rank} Start training, train_steps: {train_steps}, epochs: {args.train.num_train_epochs}"
     )
     stop_training = False
+    # Position buckets for eval: [0, window) is the SWA control group,
+    # [window, train_len) the trained range, [train_len, +) the extrapolation
+    # zone (populated when eval_max_seq_len > max_seq_len).
+    eval_bucket_boundaries = []
+    _swa_window = int(getattr(model_config, "ttt_compress_window", 0) or 0)
+    if _swa_window > 0:
+        eval_bucket_boundaries.append(_swa_window)
+    if eval_max_seq_len > args.data.max_seq_len:
+        eval_bucket_boundaries.append(args.data.max_seq_len)
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
@@ -744,10 +781,19 @@ def main():
                     eval_enable_multisource,
                     model_fwd_context,
                     model_config,
+                    bucket_boundaries=eval_bucket_boundaries,
                 )
                 if eval_metrics is not None and args.train.global_rank == 0:
                     eval_loss = eval_metrics["loss"]
-                    logger.info_rank0(f"Eval loss at global_step {global_step}: {eval_loss:.4f}")
+                    pos_summary = ", ".join(
+                        f"pos[{key.removeprefix('lm_loss_pos/')}]={value:.4f}"
+                        for key, value in eval_metrics.items()
+                        if key.startswith("lm_loss_pos/")
+                    )
+                    logger.info_rank0(
+                        f"Eval loss at global_step {global_step}: {eval_loss:.4f}"
+                        + (f", {pos_summary}" if pos_summary else "")
+                    )
                     if "ttt_output_delta_sample_ratio" in eval_metrics:
                         logger.info_rank0(
                             "Eval TTT output delta sample ratio at global_step "

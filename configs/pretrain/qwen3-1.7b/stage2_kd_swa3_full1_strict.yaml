@@ -2,17 +2,25 @@
 # This stage distills logits from a frozen full-attention teacher.
 
 model:
-  model_path: /zouxiangyu/models/Qwen/Qwen3-1.7B
+  # Initialize from the stage-1 aligned weights (converted to HF format by the
+  # launch script via scripts/merge_dcp_to_hf.py). Plain weight loading — no
+  # optimizer/step state is carried over from stage 1. The launch script
+  # auto-detects the latest stage-1 checkpoint and overrides this path.
+  model_path: /zouxiangyu/codes/Learning/In-Place-TTT/outputs/qwen3-1.7b-stage1-hidden-align-swa3-full1-strict-4096/checkpoints/global_step_5044/hf_ckpt
   tokenizer_path: /zouxiangyu/models/Qwen/Qwen3-1.7B
   foundation:
-    max_position_embeddings: 131072
-    rope_theta: 5000000.0
+    # Keep student RoPE identical to the teacher and to stage 1.
+    max_position_embeddings: 40960
+    rope_theta: 1000000.0
     # Strict 1:3 layout over 28 Qwen3-1.7B layers.
-    full_attention_layers: [0, 4, 8, 12, 16, 20, 24]
+    # full_attention_layers: [0, 4, 8, 12, 16, 20, 24]
+    full_attention_layers: []
     # Stage 2 uses SWA/Full layout only; TTT modules are not instantiated.
     ttt_layers: []
     ttt_mode: false
-    ttt_compress_window: 4096
+    # Must match stage 1 (the architecture being distilled) and stay below
+    # max_seq_len, otherwise SWA degenerates into full attention.
+    ttt_compress_window: 1024
     # KD is the only objective in this stage.
     ttt_aux_loss_weight: 0.0
     distill_teacher_path: /zouxiangyu/models/Qwen/Qwen3-1.7B
@@ -33,7 +41,7 @@ data:
   drop_last: true
 
 train:
-  output_dir: /zouxiangyu/codes/Learning/In-Place-TTT/outputs/qwen3-1.7b-stage2-kd-swa3-full1-strict-4k
+  output_dir: /zouxiangyu/codes/Learning/In-Place-TTT/outputs/qwen3-1.7b-stage2-kd-swa3-full1-strict-4096
   load_checkpoint_path: "auto"
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
@@ -42,7 +50,7 @@ train:
   rmpad: false
   use_wandb: true
   wandb_project: in-place-ttt-mini
-  wandb_name: qwen3-1.7b-stage2-kd-swa3-full1-strict-4k
+  wandb_name: qwen3-1.7b-stage2-kd-swa3-full1-strict-4096
   max_steps: 8000
   rmpad_with_pos_ids: false
   dyn_bsz_margin: 0

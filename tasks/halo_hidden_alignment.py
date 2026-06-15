@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
 from types import MethodType
 from typing import Any, Iterator, Optional
 
@@ -17,6 +17,7 @@ class HiddenAlignmentOutput:
     loss: torch.Tensor
     loss_hidden: torch.Tensor
     layer_count: int
+    layer_losses: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
 def _model_layers(model: nn.Module) -> nn.ModuleList:
@@ -172,6 +173,37 @@ def _capture_layer_outputs(
             handle.remove()
 
 
+def _layer_input_hidden(args: tuple, kwargs: dict) -> torch.Tensor:
+    if args:
+        return args[0]
+    hidden = kwargs.get("hidden_states")
+    if hidden is None:
+        raise RuntimeError("decoder layer was called without hidden states")
+    return hidden
+
+
+@contextmanager
+def _capture_layer_inputs(model: nn.Module, layer_idxs: list[int]) -> Iterator[dict[int, torch.Tensor]]:
+    captures: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def build_hook(layer_idx: int):
+        def hook(_module, args, kwargs):
+            captures[layer_idx] = _layer_input_hidden(args, kwargs).detach()
+
+        return hook
+
+    layers = _model_layers(model)
+    for layer_idx in layer_idxs:
+        handles.append(layers[layer_idx].register_forward_pre_hook(build_hook(layer_idx), with_kwargs=True))
+
+    try:
+        yield captures
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
 def _valid_token_mask(attention_mask: Optional[torch.Tensor], reference: torch.Tensor) -> Optional[torch.Tensor]:
     if attention_mask is None or attention_mask.ndim != 2:
         return None
@@ -180,19 +212,19 @@ def _valid_token_mask(attention_mask: Optional[torch.Tensor], reference: torch.T
     return attention_mask.to(device=reference.device).bool()
 
 
-def compute_hidden_alignment_loss(
+def compute_hidden_alignment_layer_losses(
     student_states: dict[int, torch.Tensor],
     teacher_states: dict[int, torch.Tensor],
     *,
     attention_mask: Optional[torch.Tensor] = None,
     loss_fn: str = "mse",
-) -> torch.Tensor:
-    if loss_fn not in {"mse", "l2norm"}:
-        raise ValueError("hidden_align_loss_fn must be one of {'mse', 'l2norm'}")
+) -> dict[int, torch.Tensor]:
+    if loss_fn not in {"mse", "l2norm", "nmse"}:
+        raise ValueError("hidden_align_loss_fn must be one of {'mse', 'l2norm', 'nmse'}")
     if set(student_states) != set(teacher_states):
         raise ValueError("student and teacher captured different hidden-alignment layers")
 
-    losses = []
+    layer_losses: dict[int, torch.Tensor] = {}
     for layer_idx in sorted(student_states):
         student = student_states[layer_idx]
         teacher = teacher_states[layer_idx].to(device=student.device, dtype=student.dtype)
@@ -207,23 +239,53 @@ def compute_hidden_alignment_loss(
         if loss_fn == "mse":
             per_dim_loss = diff.pow(2)
             if valid_mask is None:
-                losses.append(per_dim_loss.mean())
+                layer_losses[layer_idx] = per_dim_loss.mean()
             else:
                 denom = valid_mask.sum().clamp_min(1).to(torch.float32) * per_dim_loss.shape[-1]
-                losses.append((per_dim_loss * valid_mask.unsqueeze(-1)).sum() / denom)
+                layer_losses[layer_idx] = (per_dim_loss * valid_mask.unsqueeze(-1)).sum() / denom
+        elif loss_fn == "nmse":
+            # Relative MSE per token: insensitive to the absolute hidden-state
+            # scale, so massive-activation channels cannot dominate the loss.
+            per_token_loss = diff.pow(2).sum(dim=-1) / (teacher.float().pow(2).sum(dim=-1) + 1e-6)
+            if valid_mask is None:
+                layer_losses[layer_idx] = per_token_loss.mean()
+            else:
+                denom = valid_mask.sum().clamp_min(1).to(torch.float32)
+                layer_losses[layer_idx] = (per_token_loss * valid_mask).sum() / denom
         else:
             per_token_loss = torch.linalg.vector_norm(diff, dim=-1) * (diff.shape[-1] ** -0.5)
             if valid_mask is None:
-                losses.append(per_token_loss.mean())
+                layer_losses[layer_idx] = per_token_loss.mean()
             else:
                 denom = valid_mask.sum().clamp_min(1).to(torch.float32)
-                losses.append((per_token_loss * valid_mask).sum() / denom)
+                layer_losses[layer_idx] = (per_token_loss * valid_mask).sum() / denom
 
-    return torch.stack(losses).mean()
+    return layer_losses
+
+
+def compute_hidden_alignment_loss(
+    student_states: dict[int, torch.Tensor],
+    teacher_states: dict[int, torch.Tensor],
+    *,
+    attention_mask: Optional[torch.Tensor] = None,
+    loss_fn: str = "mse",
+) -> torch.Tensor:
+    layer_losses = compute_hidden_alignment_layer_losses(
+        student_states,
+        teacher_states,
+        attention_mask=attention_mask,
+        loss_fn=loss_fn,
+    )
+    return torch.stack(list(layer_losses.values())).mean()
 
 
 class HiddenAlignmentOrchestrator:
-    """Runs a frozen full-attention teacher and aligns selected student layer outputs."""
+    """Runs a frozen full-attention teacher and aligns selected student layer outputs.
+
+    align_input controls what each aligned student layer consumes:
+    - "student": the student's own previous-layer output (end-to-end, errors compound)
+    - "teacher": the teacher's previous-layer output (layer-local, errors isolated)
+    """
 
     def __init__(
         self,
@@ -232,14 +294,25 @@ class HiddenAlignmentOrchestrator:
         *,
         layer_idxs: list[int],
         loss_fn: str = "mse",
+        align_input: str = "student",
     ):
         if not layer_idxs:
             raise ValueError("layer_idxs must contain at least one layer")
+        if align_input not in {"student", "teacher"}:
+            raise ValueError("hidden_align_input must be one of {'student', 'teacher'}")
 
         self.student = student
         self.teacher = teacher
         self.layer_idxs = [int(layer_idx) for layer_idx in layer_idxs]
         self.loss_fn = loss_fn
+        self.align_input = align_input
+        # Teacher-input overrides consumed by permanently registered pre-hooks.
+        # The hooks must stay registered across forward AND backward: HF-style
+        # gradient checkpointing re-runs the layer __call__ (hooks included)
+        # during backward, and the recomputed forward must see the same inputs.
+        self._student_input_overrides: dict[int, torch.Tensor] = {}
+        if self.align_input == "teacher":
+            self._register_student_input_override_hooks()
 
         patch_model_for_hidden_alignment(self.student)
         patch_model_for_hidden_alignment(self.teacher)
@@ -250,6 +323,30 @@ class HiddenAlignmentOrchestrator:
     @property
     def config(self):
         return self.student.config
+
+    def _register_student_input_override_hooks(self) -> None:
+        layers = _model_layers(self.student)
+        for layer_idx in self.layer_idxs:
+            layers[layer_idx].register_forward_pre_hook(self._build_override_hook(layer_idx), with_kwargs=True)
+
+    def _build_override_hook(self, layer_idx: int):
+        def hook(_module, args, kwargs):
+            override = self._student_input_overrides.get(layer_idx)
+            if override is None:
+                return None
+            # Only the hidden-states argument is swapped; attention masks and
+            # rotary embeddings stay model-owned, so SWA layers keep their
+            # sliding-window mask. Cast to the incoming dtype so the layer
+            # computes exactly as it would on its own activations.
+            original = _layer_input_hidden(args, kwargs)
+            override = override.to(dtype=original.dtype)
+            if args:
+                return (override, *args[1:]), kwargs
+            kwargs = dict(kwargs)
+            kwargs["hidden_states"] = override
+            return args, kwargs
+
+        return hook
 
     def train(self, mode: bool = True):
         self.student.train(mode)
@@ -271,7 +368,12 @@ class HiddenAlignmentOrchestrator:
         ):
             kwargs.pop(key, None)
 
-        with torch.no_grad(), _capture_layer_outputs(self.teacher, self.layer_idxs, detach=True) as teacher_states:
+        teacher_input_ctx = (
+            _capture_layer_inputs(self.teacher, self.layer_idxs)
+            if self.align_input == "teacher"
+            else nullcontext({})
+        )
+        with torch.no_grad(), _capture_layer_outputs(self.teacher, self.layer_idxs, detach=True) as teacher_states, teacher_input_ctx as teacher_inputs:
             self.teacher(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -280,27 +382,42 @@ class HiddenAlignmentOrchestrator:
                 **kwargs,
             )
 
-        with _capture_layer_outputs(self.student, self.layer_idxs, detach=False) as student_states:
-            self.student(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-                halo_hidden_align_return_hidden=True,
-                **kwargs,
-            )
+        if self.align_input == "teacher":
+            self._student_input_overrides.clear()
+            self._student_input_overrides.update(teacher_inputs)
+
+        try:
+            with _capture_layer_outputs(self.student, self.layer_idxs, detach=False) as student_states:
+                self.student(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    halo_hidden_align_return_hidden=True,
+                    **kwargs,
+                )
+        finally:
+            # With grad enabled the overrides must outlive this call: gradient
+            # checkpointing re-runs the layer forwards (hooks included) during
+            # loss.backward(). Under no_grad there is no recompute, so drop
+            # them now — later plain student calls (e.g. eval LM loss) must
+            # not be teacher-forced.
+            if not torch.is_grad_enabled():
+                self._student_input_overrides.clear()
 
         missing = [layer_idx for layer_idx in self.layer_idxs if layer_idx not in student_states or layer_idx not in teacher_states]
         if missing:
             raise RuntimeError(f"failed to capture hidden states for layers: {missing}")
 
-        loss = compute_hidden_alignment_loss(
+        layer_losses = compute_hidden_alignment_layer_losses(
             student_states,
             teacher_states,
             attention_mask=attention_mask,
             loss_fn=self.loss_fn,
         )
+        loss = torch.stack(list(layer_losses.values())).mean()
         return HiddenAlignmentOutput(
             loss=loss,
             loss_hidden=loss.detach(),
             layer_count=len(self.layer_idxs),
+            layer_losses={layer_idx: layer_loss.detach() for layer_idx, layer_loss in layer_losses.items()},
         )

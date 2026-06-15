@@ -85,7 +85,7 @@ def assert_qwen3_1_7b_strict_layout(config):
     foundation = config["model"]["foundation"]
     assert foundation["full_attention_layers"] == [0, 4, 8, 12, 16, 20, 24]
     assert max(foundation["full_attention_layers"]) < 28
-    assert foundation["ttt_compress_window"] == 4096
+    assert foundation["ttt_compress_window"] > 0
 
 
 def test_qwen3_1_7b_stage1_hidden_align_config_keeps_28_layer_layout():
@@ -101,18 +101,28 @@ def test_qwen3_1_7b_stage1_hidden_align_config_keeps_28_layer_layout():
     assert foundation["ttt_layers"] == []
     assert foundation["ttt_aux_loss_weight"] == 0.0
     assert foundation["hidden_align_teacher_path"] == "/zouxiangyu/models/Qwen/Qwen3-1.7B"
-    assert foundation["hidden_align_loss_fn"] == "mse"
+    assert foundation["hidden_align_loss_fn"] == "nmse"
+    assert foundation["hidden_align_input"] == "teacher"
+    # Student RoPE must match the frozen teacher (original Qwen3-1.7B values)
+    # so the alignment loss only reflects the SWA layout difference.
+    assert foundation["rope_theta"] == 1000000.0
+    assert foundation["max_position_embeddings"] == 40960
 
-    assert config["data"]["max_seq_len"] == 512
-    assert config["train"]["lr_min"] == 1.0e-5
-    assert config["train"]["wandb_name"] == "qwen3-1.7b-stage1-hidden-align-swa3-full1-strict-512"
+    # Sequences must be longer than the SWA window, otherwise sliding
+    # attention degenerates into full attention and there is nothing to align.
+    assert config["data"]["max_seq_len"] == 4096
+    assert config["data"]["max_seq_len"] > foundation["ttt_compress_window"]
+    assert 0 < config["train"]["lr_min"] <= config["train"]["lr"]
+    assert config["train"]["wandb_name"] == "qwen3-1.7b-stage1-hidden-align-swa3-full1-strict-4096"
 
 
 def test_qwen3_1_7b_stage2_kd_config_keeps_28_layer_layout():
     config = load_config("configs/pretrain/qwen3-1.7b/stage2_kd_swa3_full1_strict.yaml")
 
     model = config["model"]
-    assert model["model_path"] == "/zouxiangyu/models/Qwen/Qwen3-1.7B"
+    # Stage 2 initializes from the stage-1 aligned weights (HF-converted).
+    assert model["model_path"].endswith("/hf_ckpt")
+    assert "stage1-hidden-align" in model["model_path"]
     assert model["tokenizer_path"] == "/zouxiangyu/models/Qwen/Qwen3-1.7B"
     assert_qwen3_1_7b_strict_layout(config)
 
@@ -122,17 +132,24 @@ def test_qwen3_1_7b_stage2_kd_config_keeps_28_layer_layout():
     assert foundation["ttt_aux_loss_weight"] == 0.0
     assert foundation["distill_teacher_path"] == "/zouxiangyu/models/Qwen/Qwen3-1.7B"
     assert foundation["distill_alpha_kl"] == 1.0
+    # Same RoPE as the teacher and stage 1; same SWA window as stage 1.
+    assert foundation["rope_theta"] == 1000000.0
+    assert foundation["max_position_embeddings"] == 40960
+    assert foundation["ttt_compress_window"] == 1024
 
     assert config["data"]["max_seq_len"] == 4096
-    assert config["train"]["lr_min"] == 1.0e-6
-    assert config["train"]["wandb_name"] == "qwen3-1.7b-stage2-kd-swa3-full1-strict-4k"
+    assert config["data"]["max_seq_len"] > foundation["ttt_compress_window"]
+    assert 0 < config["train"]["lr_min"] <= config["train"]["lr"]
+    assert config["train"]["wandb_name"] == "qwen3-1.7b-stage2-kd-swa3-full1-strict-4096"
 
 
 def test_qwen3_1_7b_stage3_cpt_config_keeps_28_layer_layout():
     config = load_config("configs/pretrain/qwen3-1.7b/stage3_cpt_swa3_full1_strict.yaml")
 
     model = config["model"]
-    assert model["model_path"] == "/zouxiangyu/models/Qwen/Qwen3-1.7B"
+    # Stage 3 initializes from the stage-2 KD weights (HF-converted).
+    assert model["model_path"].endswith("/hf_ckpt")
+    assert "stage2-kd" in model["model_path"]
     assert model["tokenizer_path"] == "/zouxiangyu/models/Qwen/Qwen3-1.7B"
     assert_qwen3_1_7b_strict_layout(config)
     foundation = model["foundation"]
@@ -140,8 +157,19 @@ def test_qwen3_1_7b_stage3_cpt_config_keeps_28_layer_layout():
     assert foundation["ttt_layers"] == [1, 5, 9, 13, 17, 21, 25]
     assert max(foundation["ttt_layers"]) < 28
     assert set(foundation["ttt_layers"]).isdisjoint(foundation["full_attention_layers"])
-    assert foundation["ttt_chunk"] == 2048
+    # Same RoPE and SWA window as stages 1/2 — the frozen backbone cannot
+    # compensate for an architecture change.
+    assert foundation["rope_theta"] == 1000000.0
+    assert foundation["max_position_embeddings"] == 40960
+    assert foundation["ttt_compress_window"] == 1024
+    assert foundation["ttt_chunk"] == foundation["ttt_compress_window"]
+    # Stage 3 trains only the TTT modules.
+    assert foundation["ttt_train_only"] is True
+
+    assert config["data"]["max_seq_len"] > foundation["ttt_compress_window"]
+    # Eval extrapolates beyond the training length.
+    assert config["data"]["eval_max_seq_len"] > config["data"]["max_seq_len"]
 
     train = config["train"]
-    assert train["lr_min"] == 5.0e-6
-    assert train["wandb_name"] == "qwen3-1.7b-stage3-cpt-swa3-full1-strict-c2048-32k"
+    assert 0 < train["lr_min"] <= train["lr"]
+    assert train["wandb_name"] == "qwen3-1.7b-stage3-cpt-swa3-full1-strict-c1024-16k"

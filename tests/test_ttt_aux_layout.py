@@ -1,3 +1,5 @@
+import os
+import subprocess
 from pathlib import Path
 
 from in_place_ttt.ttt_aux.loss import compute_ttt_aux_loss
@@ -9,6 +11,10 @@ def read_script(*parts):
     path = repo_root.joinpath(*parts)
     assert path.is_file()
     return path.read_text(encoding="utf-8")
+
+
+def repo_path(*parts):
+    return Path(__file__).resolve().parents[1].joinpath(*parts)
 
 
 def test_ttt_aux_helpers_live_under_in_place_ttt_package():
@@ -99,14 +105,63 @@ def test_qwen3_1_7b_stage_launchers_use_child_configs_and_parent_template():
     assert 'export TASK_SCRIPT="${TASK_SCRIPT:-tasks/train_torch_halo_kd.py}"' in stage2_text
     assert 'export CONFIG="${CONFIG:-configs/pretrain/qwen3-1.7b/stage2_kd_swa3_full1_strict.yaml}"' in stage2_text
     assert 'export DISTILL_TEACHER_PATH="$TEACHER_MODEL_PATH"' in stage2_text
-    assert 'STAGE1_EXP_NAME="${STAGE1_EXP_NAME:-qwen3-1.7b-stage1-hidden-align-swa3-full1-strict-512}"' in stage2_text
+    assert 'STAGE2_INIT_FROM="${STAGE2_INIT_FROM:-stage1}"' in stage2_text
+    assert 'BASE_MODEL_PATH="${BASE_MODEL_PATH:-/zouxiangyu/models/Qwen/Qwen3-1.7B}"' in stage2_text
+    assert 'export MODEL_PATH="${MODEL_PATH:-$BASE_MODEL_PATH}"' in stage2_text
+    assert 'Unsupported STAGE2_INIT_FROM' in stage2_text
+    assert 'STAGE1_EXP_NAME="${STAGE1_EXP_NAME:-qwen3-1.7b-stage1-hidden-align-swa3-full1-strict-4096}"' in stage2_text
     assert 'global_step_${STAGE1_GLOBAL_STEP}' in stage2_text
+    # Stage transitions go through HF-converted weights, not resume-style loading.
+    assert "merge_dcp_to_hf.py" in stage2_text
+    assert "LOAD_CHECKPOINT_PATH" not in stage2_text
 
     assert 'export CONFIG="${CONFIG:-configs/pretrain/qwen3-1.7b/stage3_cpt_swa3_full1_strict.yaml}"' in stage3_text
-    assert 'export EXP_NAME="${EXP_NAME:-qwen3-1.7b-stage3-cpt-swa3-full1-strict-c2048-32k}"' in stage3_text
-    assert 'STAGE2_EXP_NAME="${STAGE2_EXP_NAME:-qwen3-1.7b-stage2-kd-swa3-full1-strict-4k}"' in stage3_text
+    assert 'export EXP_NAME="${EXP_NAME:-qwen3-1.7b-stage3-cpt-swa3-full1-strict-c1024-16k}"' in stage3_text
+    assert 'STAGE2_EXP_NAME="${STAGE2_EXP_NAME:-qwen3-1.7b-stage2-kd-swa3-full1-strict-4096}"' in stage3_text
     assert 'global_step_${STAGE2_GLOBAL_STEP}' in stage3_text
+    assert "merge_dcp_to_hf.py" in stage3_text
+    assert "LOAD_CHECKPOINT_PATH" not in stage3_text
 
     assert 'bash "$SCRIPT_DIR/../run_pretrain_template.sh" "$@"' in stage1_text
     assert 'bash "$SCRIPT_DIR/../run_pretrain_template.sh" "$@"' in stage2_text
     assert 'bash "$SCRIPT_DIR/../run_pretrain_template.sh" "$@"' in stage3_text
+
+
+def test_qwen3_1_7b_stage2_launcher_can_initialize_from_base_model(tmp_path):
+    script = repo_path(
+        "scripts", "train", "longsft", "qwen3-1.7b", "run_stage2_kd_swa3_full1_strict.sh"
+    )
+    env = os.environ.copy()
+    for key in (
+        "DISTILL_TEACHER_PATH",
+        "EXP_NAME",
+        "LOAD_CHECKPOINT_PATH",
+        "MODEL_PATH",
+        "OUTPUT_DIR",
+        "STAGE1_GLOBAL_STEP",
+        "STAGE1_HF_CKPT",
+        "TEACHER_MODEL_PATH",
+        "WANDB_NAME",
+    ):
+        env.pop(key, None)
+    env.update(
+        {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "LOG_FILE": str(tmp_path / "stage2-base-dryrun.log"),
+            "STAGE2_INIT_FROM": "base",
+            "TORCHRUN": "/bin/echo",
+            "TRACE": "0",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        cwd=repo_path(),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "No stage-1 checkpoints found" not in result.stderr
+    assert "--model.model_path /zouxiangyu/models/Qwen/Qwen3-1.7B" in result.stdout

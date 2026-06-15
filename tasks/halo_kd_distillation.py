@@ -13,6 +13,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
@@ -27,6 +28,39 @@ def _full_weight(weight: torch.Tensor) -> torch.Tensor:
     if hasattr(weight, "full_tensor"):
         return weight.full_tensor()
     return weight
+
+
+def _ce_chunk_sum(
+    student_chunk: torch.Tensor,
+    labels_chunk: torch.Tensor,
+    student_weight: torch.Tensor,
+) -> torch.Tensor:
+    student_logits = F.linear(student_chunk, student_weight).float()
+    return F.cross_entropy(student_logits, labels_chunk, ignore_index=-100, reduction="sum")
+
+
+def _kl_chunk_sum(
+    student_chunk: torch.Tensor,
+    teacher_chunk: torch.Tensor,
+    valid_chunk: torch.Tensor,
+    student_weight: torch.Tensor,
+    teacher_weight: torch.Tensor,
+    temp: float,
+) -> torch.Tensor:
+    student_logits = F.linear(student_chunk, student_weight).float()
+    with torch.no_grad():
+        teacher_logits = F.linear(
+            teacher_chunk.to(student_chunk.dtype),
+            teacher_weight.to(student_chunk.dtype),
+        ).float()
+        teacher_log_prob = F.log_softmax(teacher_logits[valid_chunk] / temp, dim=-1)
+    student_log_prob = F.log_softmax(student_logits[valid_chunk] / temp, dim=-1)
+    return F.kl_div(
+        student_log_prob,
+        teacher_log_prob,
+        log_target=True,
+        reduction="sum",
+    ) * (temp * temp)
 
 
 def _chunked_ce_kl_loss(
@@ -46,6 +80,10 @@ def _chunked_ce_kl_loss(
     ce_denom = student_hidden.new_tensor(1.0, dtype=torch.float32)
     temp = float(temperature)
     chunk_size = int(chunk_size)
+    # Recompute per-chunk logits in backward instead of keeping every chunk's
+    # [chunk, vocab] activations alive until loss.backward() — otherwise the
+    # chunking saves no student-side memory at all.
+    use_ckpt = torch.is_grad_enabled() and student_hidden.requires_grad
 
     if alpha_ce > 0.0:
         if labels is None:
@@ -62,13 +100,16 @@ def _chunked_ce_kl_loss(
             if not torch.any(valid_chunk):
                 continue
 
-            student_logits = F.linear(ce_student_flat[start:end], student_weight).float()
-            ce_sum = ce_sum + F.cross_entropy(
-                student_logits,
-                labels_chunk,
-                ignore_index=-100,
-                reduction="sum",
-            )
+            if use_ckpt:
+                ce_sum = ce_sum + _grad_checkpoint(
+                    _ce_chunk_sum,
+                    ce_student_flat[start:end],
+                    labels_chunk,
+                    student_weight,
+                    use_reentrant=False,
+                )
+            else:
+                ce_sum = ce_sum + _ce_chunk_sum(ce_student_flat[start:end], labels_chunk, student_weight)
 
     if alpha_kl > 0.0:
         if teacher_hidden is None or teacher_weight is None:
@@ -88,20 +129,26 @@ def _chunked_ce_kl_loss(
             if not torch.any(valid_chunk):
                 continue
 
-            student_logits = F.linear(kl_student_flat[start:end], student_weight).float()
-            with torch.no_grad():
-                teacher_logits = F.linear(
-                    kl_teacher_flat[start:end].to(kl_student_flat.dtype),
-                    teacher_weight.to(kl_student_flat.dtype),
-                ).float()
-                teacher_log_prob = F.log_softmax(teacher_logits[valid_chunk] / temp, dim=-1)
-            student_log_prob = F.log_softmax(student_logits[valid_chunk] / temp, dim=-1)
-            kl_sum = kl_sum + F.kl_div(
-                student_log_prob,
-                teacher_log_prob,
-                log_target=True,
-                reduction="sum",
-            ) * (temp * temp)
+            if use_ckpt:
+                kl_sum = kl_sum + _grad_checkpoint(
+                    _kl_chunk_sum,
+                    kl_student_flat[start:end],
+                    kl_teacher_flat[start:end],
+                    valid_chunk,
+                    student_weight,
+                    teacher_weight,
+                    temp,
+                    use_reentrant=False,
+                )
+            else:
+                kl_sum = kl_sum + _kl_chunk_sum(
+                    kl_student_flat[start:end],
+                    kl_teacher_flat[start:end],
+                    valid_chunk,
+                    student_weight,
+                    teacher_weight,
+                    temp,
+                )
     else:
         kl_denom = ce_denom
 

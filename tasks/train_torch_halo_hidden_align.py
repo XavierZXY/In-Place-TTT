@@ -41,6 +41,7 @@ from tasks.halo_hidden_alignment import (
     configure_hidden_alignment_trainable_params,
     resolve_hidden_align_layers,
 )
+from tasks.position_lm_metrics import PositionBucketMeter, per_token_lm_loss
 
 
 logger = base.logger
@@ -96,6 +97,7 @@ def _pop_hidden_align_config(args) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "layers": foundation.pop("hidden_align_layers", None),
         "skip_ttt_layers": _as_bool(foundation.pop("hidden_align_skip_ttt_layers", False)),
         "train_scope": str(foundation.pop("hidden_align_train_scope", "layers")),
+        "align_input": str(foundation.pop("hidden_align_input", "student")),
     }
     return foundation, align
 
@@ -119,6 +121,126 @@ def _count_align_tokens(micro_batch: Dict[str, Any]) -> torch.Tensor:
     if attention_mask is not None:
         return torch.sum(attention_mask != 0)
     return torch.tensor(micro_batch["input_ids"].numel(), device=micro_batch["input_ids"].device)
+
+
+def _run_hidden_align_eval(
+    model: HiddenAlignmentOrchestrator,
+    eval_dataloader,
+    eval_batches: int,
+    enable_multisource: bool,
+    model_fwd_context,
+    teacher_lm_loss_cache: Dict[str, Any],
+    bucket_boundaries: List[int] | None = None,
+) -> Dict[str, float] | None:
+    """Evaluate hidden-alignment loss plus student/teacher LM losses.
+
+    The teacher is frozen, so its LM loss (overall and per position bucket) is
+    computed once and cached as a fixed reference for the student.
+    """
+    model.eval()
+    fsdp_group = base.get_parallel_state().fsdp_group
+    dp_size = base.get_parallel_state().dp_size
+    compute_teacher_lm = "value" not in teacher_lm_loss_cache
+    student_meter = PositionBucketMeter(bucket_boundaries) if bucket_boundaries else None
+    teacher_meter = PositionBucketMeter(bucket_boundaries) if bucket_boundaries and compute_teacher_lm else None
+
+    total_hidden_loss = 0.0
+    total_student_lm_loss = 0.0
+    total_teacher_lm_loss = 0.0
+    total_layer_losses = dict.fromkeys(model.layer_idxs, 0.0)
+    evaluated_batches = 0
+
+    with torch.no_grad():
+        eval_iterator = iter(eval_dataloader)
+        for _ in range(eval_batches):
+            try:
+                micro_batches: List[Dict[str, Any]] = next(eval_iterator)
+            except StopIteration:
+                break
+
+            align_tokens_in_batch = torch.tensor(0, dtype=torch.int32, device=base.get_device_type())
+            label_tokens_in_batch = torch.tensor(0, dtype=torch.int32, device=base.get_device_type())
+            for micro_batch in micro_batches:
+                align_tokens_in_batch += _count_align_tokens(micro_batch).to(align_tokens_in_batch.device)
+                label_tokens_in_batch += torch.sum(micro_batch["labels"] != base.IGNORE_INDEX).to(
+                    label_tokens_in_batch.device
+                )
+            align_tokens_in_batch = base.all_reduce(align_tokens_in_batch, op="sum", group=fsdp_group)
+            label_tokens_in_batch = base.all_reduce(label_tokens_in_batch, op="sum", group=fsdp_group)
+            if align_tokens_in_batch == 0 or label_tokens_in_batch == 0:
+                continue
+
+            batch_hidden_loss = 0.0
+            batch_student_lm_loss = 0.0
+            batch_teacher_lm_loss = 0.0
+            batch_layer_losses = dict.fromkeys(model.layer_idxs, 0.0)
+            for micro_batch in micro_batches:
+                if enable_multisource:
+                    base._strip_multisource_fields(micro_batch)
+                micro_batch = base._move_micro_batch_to_device(micro_batch)
+                align_scale = (_count_align_tokens(micro_batch) / align_tokens_in_batch * dp_size).item()
+                lm_scale = (
+                    torch.sum(micro_batch["labels"] != base.IGNORE_INDEX) / label_tokens_in_batch * dp_size
+                ).item()
+
+                with model_fwd_context:
+                    align_outputs = model(**micro_batch, use_cache=False)
+                batch_hidden_loss += align_outputs.loss.item() * align_scale
+                for layer_idx, layer_loss in align_outputs.layer_losses.items():
+                    batch_layer_losses[layer_idx] += layer_loss.item() * align_scale
+
+                with model_fwd_context:
+                    student_outputs = model.student(**micro_batch, use_cache=False)
+                batch_student_lm_loss += student_outputs.loss.item() * lm_scale
+                if student_meter is not None:
+                    student_meter.add(*per_token_lm_loss(student_outputs.logits, micro_batch["labels"]))
+
+                if compute_teacher_lm:
+                    with model_fwd_context:
+                        teacher_outputs = model.teacher(**micro_batch, use_cache=False)
+                    batch_teacher_lm_loss += teacher_outputs.loss.item() * lm_scale
+                    if teacher_meter is not None:
+                        teacher_meter.add(*per_token_lm_loss(teacher_outputs.logits, micro_batch["labels"]))
+                del micro_batch
+
+            total_hidden_loss += base.all_reduce(batch_hidden_loss, group=fsdp_group)
+            total_student_lm_loss += base.all_reduce(batch_student_lm_loss, group=fsdp_group)
+            layer_loss_values = base.all_reduce(
+                [batch_layer_losses[layer_idx] for layer_idx in model.layer_idxs],
+                group=fsdp_group,
+            )
+            for layer_idx, value in zip(model.layer_idxs, layer_loss_values):
+                total_layer_losses[layer_idx] += value
+            if compute_teacher_lm:
+                total_teacher_lm_loss += base.all_reduce(batch_teacher_lm_loss, group=fsdp_group)
+            evaluated_batches += 1
+
+    model.train()
+    if evaluated_batches == 0:
+        return None
+    if compute_teacher_lm:
+        teacher_lm_loss_cache["value"] = total_teacher_lm_loss / evaluated_batches
+    metrics = {
+        "hidden_align_loss": total_hidden_loss / evaluated_batches,
+        "student_lm_loss": total_student_lm_loss / evaluated_batches,
+        "teacher_lm_loss": teacher_lm_loss_cache["value"],
+    }
+    metrics.update(
+        {
+            f"hidden_align_layer_loss/{layer_idx}": value / evaluated_batches
+            for layer_idx, value in total_layer_losses.items()
+        }
+    )
+    if student_meter is not None:
+        student_buckets = student_meter.reduced_means(base.all_reduce, fsdp_group)
+        if teacher_meter is not None:
+            teacher_lm_loss_cache["buckets"] = teacher_meter.reduced_means(base.all_reduce, fsdp_group)
+        teacher_buckets = teacher_lm_loss_cache.get("buckets", {})
+        for label, value in student_buckets.items():
+            metrics[f"student_lm_loss_pos/{label}"] = value
+            if label in teacher_buckets:
+                metrics[f"lm_loss_gap_pos/{label}"] = value - teacher_buckets[label]
+    return metrics
 
 
 def main():
@@ -209,6 +331,7 @@ def main():
         "HALO hidden alignment: "
         f"teacher={align_cfg['teacher_path']}, "
         f"loss_fn={align_cfg['loss_fn']}, "
+        f"align_input={align_cfg['align_input']}, "
         f"layers={align_layers}, "
         f"skip_ttt_layers={align_cfg['skip_ttt_layers']}, "
         f"train_scope={align_cfg['train_scope']}, "
@@ -263,6 +386,7 @@ def main():
         teacher=teacher_model,
         layer_idxs=align_layers,
         loss_fn=align_cfg["loss_fn"],
+        align_input=align_cfg["align_input"],
     )
 
     optimizer_param_groups = build_ttt_optimizer_param_groups(
@@ -394,6 +518,9 @@ def main():
     )
 
     stop_training = False
+    teacher_lm_loss_cache: Dict[str, Any] = {}
+    swa_window = int(getattr(model_config, "ttt_compress_window", 0) or 0)
+    lm_bucket_boundaries = [swa_window, 2 * swa_window] if swa_window > 0 else []
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
@@ -419,6 +546,7 @@ def main():
                 base.helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
             total_loss = 0.0
+            total_layer_losses = dict.fromkeys(align_layers, 0.0)
             base.synchronize()
             start_time = time.time()
 
@@ -444,6 +572,9 @@ def main():
                     loss.backward()
 
                 total_loss += loss.item()
+                scale_value = float(loss_scale)
+                for layer_idx, layer_loss in model_outputs.layer_losses.items():
+                    total_layer_losses[layer_idx] += layer_loss.item() * scale_value
                 del micro_batch
 
             grad_norm = base.veomni_clip_grad_norm(student_model, args.train.max_grad_norm)
@@ -455,6 +586,10 @@ def main():
                 grad_norm = grad_norm.full_tensor().item()
 
             total_loss, grad_norm = base.all_reduce((total_loss, grad_norm), group=base.get_parallel_state().fsdp_group)
+            layer_loss_values = base.all_reduce(
+                [total_layer_losses[layer_idx] for layer_idx in align_layers],
+                group=base.get_parallel_state().fsdp_group,
+            )
             base.synchronize()
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())
@@ -476,6 +611,12 @@ def main():
                         "training/lr": lr,
                     }
                 )
+                train_metrics.update(
+                    {
+                        f"training/hidden_align_layer_loss/{layer_idx}": value
+                        for layer_idx, value in zip(align_layers, layer_loss_values)
+                    }
+                )
                 logger.info_rank0(
                     f"[Step {global_step}] hidden_loss={total_loss:.4f}, "
                     f"grad_norm={grad_norm:.4f}, lr={lr:.2e}, "
@@ -491,17 +632,30 @@ def main():
                 args.train.eval_batches,
                 global_step,
             ):
-                eval_loss = base._run_eval_loss(
-                    student_model,
+                eval_metrics = _run_hidden_align_eval(
+                    model,
                     eval_dataloader,
                     args.train.eval_batches,
                     eval_enable_multisource,
                     model_fwd_context,
+                    teacher_lm_loss_cache,
+                    bucket_boundaries=lm_bucket_boundaries,
                 )
-                if eval_loss is not None and args.train.global_rank == 0:
-                    logger.info_rank0(f"Eval loss at global_step {global_step}: {eval_loss:.4f}")
+                if eval_metrics is not None and args.train.global_rank == 0:
+                    gap_summary = ", ".join(
+                        f"gap[{key.removeprefix('lm_loss_gap_pos/')}]={value:.4f}"
+                        for key, value in eval_metrics.items()
+                        if key.startswith("lm_loss_gap_pos/")
+                    )
+                    logger.info_rank0(
+                        f"[Eval @ step {global_step}] "
+                        f"hidden_align_loss={eval_metrics['hidden_align_loss']:.6f}, "
+                        f"student_lm_loss={eval_metrics['student_lm_loss']:.4f}, "
+                        f"teacher_lm_loss={eval_metrics['teacher_lm_loss']:.4f}"
+                        + (f", {gap_summary}" if gap_summary else "")
+                    )
                     if args.train.use_wandb:
-                        base.wandb.log({"eval/loss": eval_loss}, step=global_step)
+                        base.wandb.log({f"eval/{key}": value for key, value in eval_metrics.items()}, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
                 profiler.step()
