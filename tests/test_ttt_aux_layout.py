@@ -116,8 +116,12 @@ def test_qwen3_1_7b_stage_launchers_use_child_configs_and_parent_template():
     assert "LOAD_CHECKPOINT_PATH" not in stage2_text
 
     assert 'export CONFIG="${CONFIG:-configs/pretrain/qwen3-1.7b/stage3_cpt_swa3_full1_strict.yaml}"' in stage3_text
-    assert 'export EXP_NAME="${EXP_NAME:-qwen3-1.7b-stage3-cpt-swa3-full1-strict-c1024-16k}"' in stage3_text
-    assert 'STAGE2_EXP_NAME="${STAGE2_EXP_NAME:-qwen3-1.7b-stage2-kd-swa3-full1-strict-4096}"' in stage3_text
+    assert 'export EXP_NAME="${EXP_NAME:-qwen3-1.7b-stage3-cpt-swa-full0-strict-c1024-64k}"' in stage3_text
+    assert 'STAGE3_INIT_FROM="${STAGE3_INIT_FROM:-stage2}"' in stage3_text
+    assert 'BASE_MODEL_PATH="${BASE_MODEL_PATH:-/zouxiangyu/models/Qwen/Qwen3-1.7B}"' in stage3_text
+    assert 'export MODEL_PATH="${MODEL_PATH:-$BASE_MODEL_PATH}"' in stage3_text
+    assert 'Unsupported STAGE3_INIT_FROM' in stage3_text
+    assert 'STAGE2_EXP_NAME="${STAGE2_EXP_NAME:-qwen3-1.7b-stage2-kd-swa-full0-strict-8192}"' in stage3_text
     assert 'global_step_${STAGE2_GLOBAL_STEP}' in stage3_text
     assert "merge_dcp_to_hf.py" in stage3_text
     assert "LOAD_CHECKPOINT_PATH" not in stage3_text
@@ -164,4 +168,42 @@ def test_qwen3_1_7b_stage2_launcher_can_initialize_from_base_model(tmp_path):
     )
 
     assert "No stage-1 checkpoints found" not in result.stderr
+    assert "--model.model_path /zouxiangyu/models/Qwen/Qwen3-1.7B" in result.stdout
+
+
+def test_qwen3_1_7b_stage3_launcher_can_initialize_from_base_model(tmp_path):
+    script = repo_path(
+        "scripts", "train", "longsft", "qwen3-1.7b", "run_stage3_cpt_swa3_full1_strict.sh"
+    )
+    env = os.environ.copy()
+    for key in (
+        "EXP_NAME",
+        "LOAD_CHECKPOINT_PATH",
+        "MODEL_PATH",
+        "OUTPUT_DIR",
+        "STAGE2_GLOBAL_STEP",
+        "STAGE2_HF_CKPT",
+        "WANDB_NAME",
+    ):
+        env.pop(key, None)
+    env.update(
+        {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "LOG_FILE": str(tmp_path / "stage3-base-dryrun.log"),
+            "STAGE3_INIT_FROM": "base",
+            "TORCHRUN": "/bin/echo",
+            "TRACE": "0",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        cwd=repo_path(),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "No stage-2 checkpoints found" not in result.stderr
     assert "--model.model_path /zouxiangyu/models/Qwen/Qwen3-1.7B" in result.stdout

@@ -241,6 +241,26 @@ def _build_dataset_for_args(args, transform):
     )
 
 
+def _next_train_micro_batches(
+    train_dataloader,
+    data_iterator,
+    *,
+    restart_on_stop_iteration: bool,
+    stream_epoch: int,
+):
+    try:
+        return next(data_iterator), data_iterator, stream_epoch, False
+    except StopIteration:
+        if not restart_on_stop_iteration:
+            raise
+
+        stream_epoch += 1
+        if hasattr(train_dataloader, "set_epoch"):
+            train_dataloader.set_epoch(stream_epoch)
+        data_iterator = iter(train_dataloader)
+        return next(data_iterator), data_iterator, stream_epoch, True
+
+
 def _move_micro_batch_to_device(micro_batch: Dict[str, Any]) -> Dict[str, Any]:
     return {
         key: value.to(get_device_type(), non_blocking=True) if isinstance(value, torch.Tensor) else value
@@ -626,14 +646,23 @@ def main():
             disable=args.train.local_rank != 0,
         )
         data_iterator = iter(train_dataloader)
+        restart_on_stop_iteration = args.data.datasets_type == "iterable"
+        stream_epoch = epoch
         for _ in range(start_step, train_steps):
-            global_step += 1
-
             try:
-                micro_batches: List[Dict[str, Any]] = next(data_iterator)
+                micro_batches, data_iterator, stream_epoch, restarted = _next_train_micro_batches(
+                    train_dataloader,
+                    data_iterator,
+                    restart_on_stop_iteration=restart_on_stop_iteration,
+                    stream_epoch=stream_epoch,
+                )
             except StopIteration:
                 logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
                 break
+            if restarted:
+                logger.info(f"epoch:{epoch} Dataloader restarted at stream_epoch:{stream_epoch}")
+
+            global_step += 1
 
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)

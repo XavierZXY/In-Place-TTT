@@ -323,22 +323,23 @@ def _resolve_eos_token_ids(config: Any, tokenizer: Any, explicit_ids: list[int])
     return sorted(eos_ids)
 
 
-def load_model(
-    model_path: str,
-    dtype_name: str,
-    attn_implementation: str,
-    device: str,
+def apply_ttt_runtime_overrides(
+    config: Any,
+    disable_ttt: bool,
     disable_ttt_fast_weights: bool,
     ttt_prefill_update_partial: bool,
     ttt_prefill_partial_min_tokens: int | None,
-) -> tuple[torch.nn.Module, Any, Any]:
-    print(f"[load] model_path={model_path}")
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    if disable_ttt_fast_weights:
-        original_ttt_lr = getattr(config, "ttt_lr", None)
+) -> None:
+    if disable_ttt:
+        config.ttt_mode = False
+        config.ttt_layers = []
+        config.ttt_lr = 0.0
+        config.disable_ttt = True
+        config.disable_ttt_fast_weights = True
+    elif disable_ttt_fast_weights:
         config.ttt_lr = 0.0
         config.disable_ttt_fast_weights = True
-        print(f"[load] disable_ttt_fast_weights=True original_ttt_lr={original_ttt_lr} effective_ttt_lr=0.0")
+
     if ttt_prefill_update_partial:
         config.ttt_prefill_update_partial = True
         if ttt_prefill_partial_min_tokens is not None:
@@ -348,6 +349,41 @@ def load_model(
                     f"got {ttt_prefill_partial_min_tokens}"
                 )
             config.ttt_prefill_partial_min_tokens = int(ttt_prefill_partial_min_tokens)
+
+
+def load_model(
+    model_path: str,
+    dtype_name: str,
+    attn_implementation: str,
+    device: str,
+    disable_ttt: bool,
+    disable_ttt_fast_weights: bool,
+    ttt_prefill_update_partial: bool,
+    ttt_prefill_partial_min_tokens: int | None,
+) -> tuple[torch.nn.Module, Any, Any]:
+    print(f"[load] model_path={model_path}")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    original_ttt_mode = getattr(config, "ttt_mode", None)
+    original_ttt_layers = getattr(config, "ttt_layers", None)
+    original_ttt_lr = getattr(config, "ttt_lr", None)
+    apply_ttt_runtime_overrides(
+        config=config,
+        disable_ttt=disable_ttt,
+        disable_ttt_fast_weights=disable_ttt_fast_weights,
+        ttt_prefill_update_partial=ttt_prefill_update_partial,
+        ttt_prefill_partial_min_tokens=ttt_prefill_partial_min_tokens,
+    )
+    if disable_ttt:
+        print(
+            "[load] disable_ttt=True "
+            f"original_ttt_mode={original_ttt_mode} "
+            f"original_ttt_layers={original_ttt_layers} "
+            f"original_ttt_lr={original_ttt_lr} "
+            "effective_ttt_mode=False effective_ttt_layers=[] effective_ttt_lr=0.0"
+        )
+    elif disable_ttt_fast_weights:
+        print(f"[load] disable_ttt_fast_weights=True original_ttt_lr={original_ttt_lr} effective_ttt_lr=0.0")
+    if ttt_prefill_update_partial:
         print(
             "[load] ttt_prefill_update_partial=True "
             f"min_tokens={getattr(config, 'ttt_prefill_partial_min_tokens', 1)}"
@@ -628,6 +664,101 @@ def _load_samples(ruler_root: Path, length: int, n_per_task: int, default_max_ne
     raise FileNotFoundError(f"No RULER data found at {parquet_path} or {jsonl_dir}")
 
 
+def select_shard(rows: list[dict[str, Any]], num_shards: int, shard_id: int) -> list[dict[str, Any]]:
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if shard_id < 0 or shard_id >= num_shards:
+        raise ValueError(f"shard_id must be in [0, {num_shards}), got {shard_id}")
+
+    selected = []
+    for sample_index, row in enumerate(rows):
+        if sample_index % num_shards != shard_id:
+            continue
+        copied = dict(row)
+        copied["sample_index"] = sample_index
+        selected.append(copied)
+    return selected
+
+
+def _shard_suffix(num_shards: int, shard_id: int) -> str:
+    return "" if num_shards == 1 else f"_shard_{shard_id:02d}"
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _summary_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    per_task_scores: dict[str, list[float]] = defaultdict(list)
+    repetition_stop_count = 0
+    for row in rows:
+        per_task_scores[row["task"]].append(float(row["score"]))
+        if row.get("repetition_stop"):
+            repetition_stop_count += 1
+
+    summary: dict[str, Any] = {
+        task: {"n": len(scores), "score": sum(scores) / len(scores)}
+        for task, scores in sorted(per_task_scores.items())
+        if scores
+    }
+    total = sum(len(scores) for scores in per_task_scores.values())
+    overall = sum(score for scores in per_task_scores.values() for score in scores) / max(total, 1)
+    summary["__overall__"] = {"n": total, "score": overall}
+    if repetition_stop_count:
+        summary["__repetition_stop_triggered__"] = repetition_stop_count
+    return summary
+
+
+def merge_shard_outputs(out_dir: Path, lengths: list[int], num_shards: int) -> dict[int, dict[str, Any]]:
+    if num_shards < 2:
+        raise ValueError(f"merge_shard_outputs requires num_shards >= 2, got {num_shards}")
+
+    all_summaries = {}
+    for length in lengths:
+        rows = []
+        for shard_id in range(num_shards):
+            samples_path = out_dir / f"len_{length}_shard_{shard_id:02d}_samples.jsonl"
+            if not samples_path.exists():
+                raise FileNotFoundError(f"missing shard samples: {samples_path}")
+            rows.extend(_read_jsonl(samples_path))
+
+        seen_indices = set()
+        for row in rows:
+            if "sample_index" not in row:
+                raise ValueError(f"missing sample_index in shard row for length={length}: {row}")
+            sample_index = int(row["sample_index"])
+            if sample_index in seen_indices:
+                raise ValueError(f"duplicate sample_index={sample_index} for length={length}")
+            seen_indices.add(sample_index)
+
+        rows.sort(key=lambda row: int(row["sample_index"]))
+        samples_path = out_dir / f"len_{length}_samples.jsonl"
+        with samples_path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        summary = _summary_from_rows(rows)
+        summary["__eval_version__"] = "local_ruler_v1_sharded"
+        summary["__merged_from_shards__"] = {"num_shards": num_shards}
+        summary_path = out_dir / f"len_{length}_summary.json"
+        with summary_path.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        print(f"[merge-{length}] shards={num_shards} samples={len(rows)} overall={summary['__overall__']['score']:.3f}")
+        all_summaries[length] = summary
+
+    summary_path = out_dir / "summary_all_lengths.json"
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(all_summaries, f, indent=2, ensure_ascii=False)
+    print(f"[merge] saved {summary_path}")
+    return all_summaries
+
+
 def _load_existing_rows(samples_path: Path, expected_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not samples_path.exists():
         return []
@@ -653,6 +784,10 @@ def _load_existing_rows(samples_path: Path, expected_rows: list[dict[str, Any]])
 
     for index, row in enumerate(rows):
         if row.get("task") != expected_rows[index].get("task"):
+            samples_path.unlink()
+            return []
+        expected_sample_index = expected_rows[index].get("sample_index")
+        if expected_sample_index is not None and row.get("sample_index") != expected_sample_index:
             samples_path.unlink()
             return []
 
@@ -684,8 +819,14 @@ def eval_length(
     device: str,
     batch_size: int,
     run_meta: dict[str, Any],
+    num_shards: int,
+    shard_id: int,
 ) -> dict[str, Any]:
     sample_rows = _load_samples(ruler_root, length, n_per_task, max_new_tokens)
+    total_sample_count = len(sample_rows)
+    if num_shards > 1:
+        sample_rows = select_shard(sample_rows, num_shards=num_shards, shard_id=shard_id)
+
     by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in sample_rows:
         by_task[row["task"]].append(row)
@@ -693,8 +834,9 @@ def eval_length(
     stop_string_criteria = StopStringCriteria(tokenizer=tokenizer, stop_strings=stop_strings) if stop_strings else None
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    samples_path = out_dir / f"len_{length}_samples.jsonl"
-    summary_path = out_dir / f"len_{length}_summary.json"
+    shard_suffix = _shard_suffix(num_shards, shard_id)
+    samples_path = out_dir / f"len_{length}{shard_suffix}_samples.jsonl"
+    summary_path = out_dir / f"len_{length}{shard_suffix}_summary.json"
 
     existing_rows = _load_existing_rows(samples_path, sample_rows)
     done_count = len(existing_rows)
@@ -703,6 +845,7 @@ def eval_length(
     else:
         print(
             f"[eval-{length}] samples={len(sample_rows)} n_per_task={n_per_task} "
+            f"shard={shard_id}/{num_shards} total_samples={total_sample_count} "
             f"chat_template={chat_template or 'none'} max_new_tokens={max_new_tokens} "
             f"strip_think={strip_think} stop_strings={stop_strings or 'none'} "
             f"repetition_stop={repetition_stop} batch_size={batch_size}"
@@ -791,6 +934,8 @@ def eval_length(
                         "gen": generation_raw,
                         "answer": row["answer"],
                     }
+                    if "sample_index" in row:
+                        output_row["sample_index"] = row["sample_index"]
                     if repetition_meta:
                         output_row["repetition_stop"] = repetition_meta
                         repetition_stop_count += 1
@@ -823,6 +968,7 @@ def eval_length(
     summary["__stop_strings__"] = stop_strings
     summary["__assistant_prefill__"] = assistant_prefill
     summary["__batch_size__"] = batch_size
+    summary["__shard__"] = {"num_shards": num_shards, "shard_id": shard_id, "total_samples": total_sample_count}
     summary["__run_meta__"] = run_meta
     summary["__repetition_stop__"] = {
         "enabled": repetition_stop,
@@ -849,7 +995,7 @@ def eval_length(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run local HuggingFace RULER evaluation.")
-    parser.add_argument("--model_path", required=True, help="HF checkpoint directory.")
+    parser.add_argument("--model_path", default="", help="HF checkpoint directory.")
     parser.add_argument("--abbr", required=True, help="Short name used for output directory and logs.")
     parser.add_argument("--lengths", nargs="+", type=int, default=[4096, 8192, 16384])
     parser.add_argument("--n_per_task", type=int, default=50)
@@ -866,6 +1012,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strip_think", action="store_true")
     parser.add_argument("--stop_strings", nargs="*", default=[])
     parser.add_argument("--assistant_prefill", default="")
+    parser.add_argument(
+        "--disable_ttt",
+        action="store_true",
+        help="Disable TTT runtime path by setting ttt_mode=False and clearing ttt_layers.",
+    )
     parser.add_argument(
         "--disable_ttt_fast_weights",
         action="store_true",
@@ -890,6 +1041,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat_stop_diversity_window", type=int, default=160)
     parser.add_argument("--repeat_stop_diversity_unique_ratio", type=float, default=0.22)
     parser.add_argument("--repeat_stop_diversity_top_ratio", type=float, default=0.18)
+    parser.add_argument("--num_shards", type=int, default=1)
+    parser.add_argument("--shard_id", type=int, default=0)
+    parser.add_argument("--merge_shards_only", action="store_true")
     return parser.parse_args()
 
 
@@ -898,11 +1052,19 @@ def main() -> None:
     out_dir = Path(args.out_root) / args.abbr
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.merge_shards_only:
+        merge_shard_outputs(out_dir=out_dir, lengths=args.lengths, num_shards=args.num_shards)
+        return
+
+    if not args.model_path:
+        raise ValueError("--model_path is required unless --merge_shards_only is set")
+
     model, tokenizer, config = load_model(
         model_path=args.model_path,
         dtype_name=args.dtype,
         attn_implementation=args.attn_implementation,
         device=args.device,
+        disable_ttt=args.disable_ttt,
         disable_ttt_fast_weights=args.disable_ttt_fast_weights,
         ttt_prefill_update_partial=args.ttt_prefill_update_partial,
         ttt_prefill_partial_min_tokens=args.ttt_prefill_partial_min_tokens,
@@ -916,13 +1078,21 @@ def main() -> None:
         "ttt_target": getattr(config, "ttt_target", None),
         "ttt_prefill_update_partial": getattr(config, "ttt_prefill_update_partial", None),
         "ttt_prefill_partial_min_tokens": getattr(config, "ttt_prefill_partial_min_tokens", None),
-        "disable_ttt_fast_weights": args.disable_ttt_fast_weights,
+        "disable_ttt": getattr(config, "disable_ttt", args.disable_ttt),
+        "disable_ttt_fast_weights": getattr(config, "disable_ttt_fast_weights", args.disable_ttt_fast_weights),
     }
 
     print(f"[main] output={out_dir}")
     if args.batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {args.batch_size}")
-    print(f"[main] lengths={args.lengths} eos_token_ids={eos_token_ids} max_seq={args.max_seq} batch_size={args.batch_size}")
+    if args.num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {args.num_shards}")
+    if args.shard_id < 0 or args.shard_id >= args.num_shards:
+        raise ValueError(f"shard_id must be in [0, {args.num_shards}), got {args.shard_id}")
+    print(
+        f"[main] lengths={args.lengths} eos_token_ids={eos_token_ids} max_seq={args.max_seq} "
+        f"batch_size={args.batch_size} shard={args.shard_id}/{args.num_shards}"
+    )
 
     all_summaries = {}
     for length in args.lengths:
@@ -951,12 +1121,15 @@ def main() -> None:
             device=args.device,
             batch_size=args.batch_size,
             run_meta=run_meta,
+            num_shards=args.num_shards,
+            shard_id=args.shard_id,
         )
 
-    summary_path = out_dir / "summary_all_lengths.json"
-    with summary_path.open("w", encoding="utf-8") as f:
-        json.dump(all_summaries, f, indent=2, ensure_ascii=False)
-    print(f"[main] saved {summary_path}")
+    if args.num_shards == 1:
+        summary_path = out_dir / "summary_all_lengths.json"
+        with summary_path.open("w", encoding="utf-8") as f:
+            json.dump(all_summaries, f, indent=2, ensure_ascii=False)
+        print(f"[main] saved {summary_path}")
 
 
 if __name__ == "__main__":
