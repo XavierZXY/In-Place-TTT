@@ -110,6 +110,8 @@ class Qwen3MLP(nn.Module):
                 self.hidden_size, self.hidden_size, kernel_size=5, padding=2,
                 groups=self.hidden_size, bias=False,
             )
+            if getattr(config, "ttt_key_norm", False):
+                self.ttt_key_norm = Qwen3RMSNorm(self.intermediate_size, eps=config.rms_norm_eps)
 
     # TTT: new method
     def padding(self, x):
@@ -129,13 +131,26 @@ class Qwen3MLP(nn.Module):
         # TTT inference path: track and optionally update the down_proj weight
         present_down_proj_w = self.down_proj.weight.clone() if past_w is None else past_w
         if t is None:
+            if hasattr(self, "ttt_key_norm"):
+                h_norm = self.ttt_key_norm(h)
+                delta_w = present_down_proj_w - self.down_proj.weight
+                base_out = nn.functional.linear(h, self.down_proj.weight, self.down_proj.bias)
+                delta_out = nn.functional.linear(h_norm, delta_w, None)
+                return base_out + delta_out, present_down_proj_w
             return nn.functional.linear(h, present_down_proj_w, self.down_proj.bias), present_down_proj_w
         bs, seq_len, _ = x.shape
         if seq_len < self.ttt_chunk and not update_partial:
+            if hasattr(self, "ttt_key_norm"):
+                h_norm = self.ttt_key_norm(h)
+                delta_w = present_down_proj_w - self.down_proj.weight
+                base_out = nn.functional.linear(h, self.down_proj.weight, self.down_proj.bias)
+                delta_out = nn.functional.linear(h_norm, delta_w, None)
+                return base_out + delta_out, present_down_proj_w
             return nn.functional.linear(h, present_down_proj_w, self.down_proj.bias), present_down_proj_w
         # Pad and chunk
         t_padded = self.padding(t)
         h_padded = self.padding(h)
+        h_norm_padded = self.padding(self.ttt_key_norm(h)) if hasattr(self, "ttt_key_norm") else None
         bs, chunk_num, chunk_size, _ = t_padded.shape
         t_conv = (
             self.ttt_conv(t_padded.transpose(-1, -2).reshape(bs * chunk_num, -1, chunk_size))
@@ -145,15 +160,24 @@ class Qwen3MLP(nn.Module):
         current_w = present_down_proj_w
         y = torch.zeros_like(t_conv)
         for i, current_y, current_t, current_h in zip(range(chunk_num), y[0], t_conv[0], h_padded[0]):
-            current_y = contract("d h, c h -> c d", current_w, current_h)
+            if h_norm_padded is None:
+                current_y = contract("d h, c h -> c d", current_w, current_h)
+            else:
+                current_h_norm = h_norm_padded[0][i]
+                delta_w = current_w - self.down_proj.weight
+                current_y = contract("d h, c h -> c d", self.down_proj.weight, current_h) + contract(
+                    "d h, c h -> c d", delta_w, current_h_norm
+                )
             y[0][i] = current_y
             if seq_len % self.ttt_chunk == 0 or i != chunk_num - 1 or update_partial:
                 if self.ttt_proj is not None:
+                    current_key = current_h if h_norm_padded is None else h_norm_padded[0][i]
                     dw = (
-                        contract("c h, c d, d e -> e h", current_h, current_t, self.ttt_proj.weight) * self.ttt_lr
+                        contract("c h, c d, d e -> e h", current_key, current_t, self.ttt_proj.weight) * self.ttt_lr
                     )
                 else:
-                    dw = contract("c h, c d -> d h", current_h, current_t) * self.ttt_lr
+                    current_key = current_h if h_norm_padded is None else h_norm_padded[0][i]
+                    dw = contract("c h, c d -> d h", current_key, current_t) * self.ttt_lr
                 current_w = current_w + dw
         out = rearrange(y, "b t c d -> b (t c) d")[:, :seq_len, :]
         return out, current_w

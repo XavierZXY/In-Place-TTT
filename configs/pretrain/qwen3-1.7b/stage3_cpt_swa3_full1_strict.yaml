@@ -11,8 +11,8 @@ model:
   foundation:
     # Keep RoPE identical to stages 1/2: the backbone is frozen in this stage
     # (ttt_train_only) and cannot compensate for a positional-encoding change.
-    max_position_embeddings: 40960
-    rope_theta: 1000000.0
+    max_position_embeddings: 131072
+    rope_theta: 3260000.0
     # Strict 1:3 layout over 28 Qwen3-1.7B layers.
     # full_attention_layers: [0, 4, 8, 12, 16, 20, 24]
     full_attention_layers: []

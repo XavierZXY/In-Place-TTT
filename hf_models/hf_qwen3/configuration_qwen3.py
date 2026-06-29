@@ -185,6 +185,7 @@ class Qwen3Config(PretrainedConfig):
         ttt_layers=[0, 6, 12, 18, 24, 30],
         ttt_mode=True,
         ttt_proj=True,
+        ttt_key_norm=False,
         ttt_lr=0.3,
         ttt_chunk=8192,
         ttt_target="hidden_states",
@@ -256,6 +257,7 @@ class Qwen3Config(PretrainedConfig):
         self.ttt_layers = ttt_layers
         self.ttt_mode = ttt_mode
         self.ttt_proj = ttt_proj
+        self.ttt_key_norm = bool(ttt_key_norm)
         self.ttt_lr = ttt_lr
         self.ttt_chunk = ttt_chunk
         self.ttt_target = ttt_target

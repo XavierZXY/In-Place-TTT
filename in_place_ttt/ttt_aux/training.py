@@ -177,7 +177,7 @@ def collect_ttt_aux_params(model, *, require_grad_only: bool = True):
         if mlp is None or not hasattr(mlp, "ttt_conv"):
             continue
 
-        for module_name in ("ttt_conv", "ttt_proj"):
+        for module_name in ("ttt_conv", "ttt_proj", "ttt_key_norm"):
             module = getattr(mlp, module_name, None)
             param = getattr(module, "weight", None) if module is not None else None
             if param is None or (require_grad_only and not param.requires_grad):

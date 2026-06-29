@@ -100,6 +100,13 @@ class Qwen3MLP(nn.Module):
                 self.hidden_size, self.hidden_size, kernel_size=5, padding=2,
                 groups=self.hidden_size, bias=False,
             )
+            # TTT: optional key normalization. Normalizes the gate key/query h
+            # (= SiLU(gate)*up, intermediate_size dims) so the un-normalized
+            # h_t . h_c' gate cannot be dominated by a few massive-norm tokens.
+            # Only the delta (fast-weight) path consumes the normalized key; the
+            # base MLP path keeps the original h (see forward).
+            if getattr(config, "ttt_key_norm", False):
+                self.ttt_key_norm = Qwen3RMSNorm(self.intermediate_size, eps=config.rms_norm_eps)
 
     # TTT: new method
     def padding(self, x):
@@ -221,17 +228,41 @@ class Qwen3MLP(nn.Module):
             prediction_states = contract("b t c d, d e -> b t c e", t_conv, self.ttt_proj.weight)
         else:
             prediction_states = t_conv
-        d_down_proj = contract(
-            "b t c h, b t c d -> b t d h",
-            h_padded[:, :-1], prediction_states[:, :-1],
-        )
-        delta_down_proj = d_down_proj * self.ttt_lr
-        d_down_proj = torch.cat(
-            [repeat(self.down_proj.weight, "d h -> b 1 d h", b=bs), delta_down_proj],
-            dim=1,
-        )
-        d_down_proj_sum = d_down_proj.cumsum(dim=1)
-        down_proj = contract("b t d h, b t c h -> b t c d", d_down_proj_sum, h_padded)
+        if not hasattr(self, "ttt_key_norm"):
+            # Original fused path — kept verbatim so that disabling key-norm is
+            # bit-for-bit identical to the pre-change behavior (the base W0 and
+            # the delta share one cumsum and one contract over the same h).
+            d_down_proj = contract(
+                "b t c h, b t c d -> b t d h",
+                h_padded[:, :-1], prediction_states[:, :-1],
+            )
+            delta_down_proj = d_down_proj * self.ttt_lr
+            d_down_proj = torch.cat(
+                [repeat(self.down_proj.weight, "d h -> b 1 d h", b=bs), delta_down_proj],
+                dim=1,
+            )
+            d_down_proj_sum = d_down_proj.cumsum(dim=1)
+            down_proj = contract("b t d h, b t c h -> b t c d", d_down_proj_sum, h_padded)
+        else:
+            # Key-norm path: the gate key/query that builds and reads the fast
+            # weights uses the normalized h, while the frozen base projection
+            # W0 keeps the original h — otherwise normalizing h would also
+            # rewrite the pretrained MLP output and break it.
+            h_norm_padded = self.padding(self.ttt_key_norm(h))
+            d_down_proj = contract(
+                "b t c h, b t c d -> b t d h",
+                h_norm_padded[:, :-1], prediction_states[:, :-1],
+            )
+            delta_down_proj = d_down_proj * self.ttt_lr
+            # cumsum over deltas only (W0 handled separately); a leading zero
+            # block preserves the same causal offset: chunk t reads sum_{j<t}.
+            delta_w_sum = torch.cat(
+                [torch.zeros_like(delta_down_proj[:, :1]), delta_down_proj],
+                dim=1,
+            ).cumsum(dim=1)
+            base_out = contract("d h, b t c h -> b t c d", self.down_proj.weight, h_padded)
+            delta_out = contract("b t d h, b t c h -> b t c d", delta_w_sum, h_norm_padded)
+            down_proj = base_out + delta_out
         self._record_ttt_future_chunk_aux(prediction_states, target_padded, x.shape[1])
         self._record_ttt_monitor_stats(delta_down_proj, h_padded, down_proj)
         return rearrange(down_proj, "b t c d -> b (t c) d")[:, : x.shape[1], :]
