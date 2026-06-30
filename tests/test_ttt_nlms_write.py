@@ -122,7 +122,7 @@ def test_nlms_block_residual_matches_manual_math():
     R0 = V0 - torch.einsum("c h, d h -> c d", K0, S_delta0)  # [c, d]
     denom_c = lam + (K0 * K0).sum(dim=-1, keepdim=True)      # [c, 1] per-key
     R0n = R0 / denom_c                                        # normalize each residual row
-    dW_expected = eta * torch.einsum("c d, c h -> d h", R0n, K0)
+    dW_expected = eta * torch.einsum("c d, c h -> d h", R0n, K0) / K0.shape[0]  # avg over chunk
     w_expected_after_first = mlp.down_proj.weight + dW_expected
 
     # run forward and capture the fast weight after processing; with 2 chunks the

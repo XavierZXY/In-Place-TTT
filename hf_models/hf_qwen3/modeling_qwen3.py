@@ -258,6 +258,10 @@ class Qwen3MLP(nn.Module):
                 denom_i = self.ttt_nlms_lambda + (Ki * Ki).sum(dim=-1, keepdim=True)  # [b, c, 1]
                 resid_i = resid_i / denom_i
                 dW_i = contract("b c d, b c h -> b d h", resid_i, Ki) * self.ttt_lr   # [b, d, h_dim]
+                # average the C per-key rank-1 writes over the chunk: applying all C
+                # writes simultaneously against a stale chunk-start S otherwise scales
+                # the combined update ~sqrt(C), causing S to diverge over many chunks.
+                dW_i = dW_i / Ki.shape[1]
                 per_chunk_dw.append(dW_i)
                 # accumulate: history (detached if enabled) + current differentiable write
                 S = S_hist + dW_i

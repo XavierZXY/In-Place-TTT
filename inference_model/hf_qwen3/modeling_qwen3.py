@@ -211,6 +211,8 @@ class Qwen3MLP(nn.Module):
             denom = self.ttt_nlms_lambda + (key * key).sum(dim=-1, keepdim=True)  # [c, 1] per-key
             residual = residual / denom
             dw = contract("c d, c h -> d h", residual, key) * self.ttt_lr
+            # average per-key writes over the chunk (matches training; bounds S growth)
+            dw = dw / key.shape[0]
         else:  # outer
             dw = contract("c h, c d -> d h", key, value) * self.ttt_lr
         return current_w + dw

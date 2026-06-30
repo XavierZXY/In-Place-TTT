@@ -274,10 +274,10 @@ def nlms_output_delta_for_etas(K, V, W0, etas, lam=1.0):
             out_i = base_i + delta_i
             num += float((out_i - base_i).norm())
             den += float(out_i.norm().clamp_min(1e-12))
-            # per-key residual write
+            # per-key residual write, averaged over the chunk (matches modeling)
             pred_i = torch.einsum("c h, d h -> c d", Ki, S)
             resid_i = (Vi - pred_i) / (lam + (Ki * Ki).sum(dim=-1, keepdim=True))
-            S = S + eta * torch.einsum("c d, c h -> d h", resid_i, Ki)
+            S = S + eta * torch.einsum("c d, c h -> d h", resid_i, Ki) / Ki.shape[0]
         out[eta] = num / max(den, 1e-12)
     return out
 
