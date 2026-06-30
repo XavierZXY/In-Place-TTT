@@ -214,3 +214,24 @@ write_collision 各层 0.45–0.51(层 25 最高 0.51–0.61,eff_rank 最低 131
 1. 先验证 bf16 溢出假设:打印真实 ckpt 首 chunk 的 resid/dW 数值范围(加诊断,read-only)。若溢出 → 全 fp32 路径或 resid clip。
 2. 小 η 起步 + decay:η=0.3~1(已知 forward 有界区)+ α=0.3,看 decay 能否让"有界但学得动"——D 证明 η≤1 写入埋噪声地板,但 decay 改变动力学,可能 ttt_do 上移。
 3. 回到 motivation 层:NLMS 在 outer-ckpt 上 drop-in 本就 off-distribution(阶段 A 早已预测),或许应放弃"在 outer-ckpt 上 matched CPT",改为从更早 stage、用更温和的写规则共同训练。
+
+## C decay sweep 完整相图(2026-06-30):C 也无"稳+可学"窗口
+| η | α | ttt_dw | ttt_do | loss | 区域 |
+|---|---|---|---|---|---|
+| 1 | 0.5 | 0.00 | 1.66e-3 | 5.27 | 稳·学不动 |
+| 5 | 0.1 | 2.58e36💥 | 9.4e-2 | 7.01↑ | 爆 |
+| 5 | 0.5 | 2.58e36💥 | 9.3e-2 | 7.07↑ | 爆 |
+| 5 | 0.9 | 0.00 | 1.66e-3 | 4.24 | 稳·学不动 |
+
+**核心发现:decay 救不了,因为发散在 chunk 内、decay 在 chunk 间。**
+- η=5 时单 chunk 的 `resid=V−K·Sᵀ` 配 1024 key 外积,在**该 chunk 内**就 fp32 溢出到 2.58e36(α=0.1/0.5 逐位相同 = 饱和值,非精度伪影:forward 全程 fp32,2.58e36 < bf16 max)。chunk **间**的 (1−α) 衰减来不及介入。
+- α=0.9 能压住(把上一 chunk S 几乎清零 → 降低 chunk 内 `K·Sᵀ` 起点),但 S 留不住记忆 → ttt_do 回噪声地板,学不动。
+- 与 D 同构的张力,换了旋钮:**稳定与可学不可兼得**。grad_norm 在 detach=false 时为 inf(backward 穿 16 chunk 爆,但被 max_grad_norm=1 裁,不致命)。
+
+**C 证伪。三因素叠加锁死**:① off-dist projections 残差不收缩反放大 ② 发散粒度是 chunk 内(1024 key 同时外积),任何 chunk 间机制(decay/detach)都够不着 ③ 真实写入需 ~150× 才跳出噪声地板,而那个量级必然 chunk 内溢出。
+
+**裁决:停止在 outer-ckpt 上 drop-in/matched-CPT NLMS 的所有 forward-限幅尝试(D 提η、A 截断、C 衰减均证伪)。** 根因统一:**NLMS 在为 outer 动力学训练的 ckpt 上 off-distribution**(阶段 A R2 早已预测)。下一步需换层级而非换旋钮:
+- **选项 1(治本)**:chunk 内序贯 NLMS(write_subchunk→1 或严格逐 token),消除"1024 key 同时外积"的 chunk 内爆炸源。代价:训练吞吐大降(16k=16384 步串行)。
+- **选项 2(治本)**:从 stage1/2 早期就用 NLMS 写规则共同训练 projections,让 ttt_proj/ttt_conv 学到能让 `K·Sᵀ` 预测 V 的表示(残差自然收缩)。代价:重训成本高。
+- **选项 3**:DeltaNet/Gated chunkwise 成熟 form,放弃"纯 NLMS"叙事。
+- 待与用户讨论选型。
