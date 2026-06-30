@@ -26,3 +26,10 @@ def test_train_config_default_write_rule_outer():
 def test_train_config_rejects_bad_write_rule():
     with pytest.raises(ValueError):
         _cfg(ttt_write_rule="bogus")
+
+
+def test_train_mlp_reads_write_rule():
+    torch.manual_seed(0)
+    mlp = Qwen3MLP(_cfg(ttt_write_rule="nlms", ttt_nlms_lambda=2.0), layer_idx=0)
+    assert mlp.ttt_write_rule == "nlms"
+    assert mlp.ttt_nlms_lambda == 2.0

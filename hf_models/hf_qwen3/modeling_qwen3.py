@@ -96,6 +96,8 @@ class Qwen3MLP(nn.Module):
             else:
                 self.ttt_proj = None
             self.ttt_lr = getattr(config, "ttt_lr", 0.3)
+            self.ttt_write_rule = getattr(config, "ttt_write_rule", "outer")
+            self.ttt_nlms_lambda = float(getattr(config, "ttt_nlms_lambda", 1.0))
             self.ttt_conv = nn.Conv1d(
                 self.hidden_size, self.hidden_size, kernel_size=5, padding=2,
                 groups=self.hidden_size, bias=False,
