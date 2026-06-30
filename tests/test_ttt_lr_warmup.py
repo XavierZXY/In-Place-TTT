@@ -36,3 +36,36 @@ def test_config_warmup_defaults_and_validation():
 def test_mlp_ttt_lr_effective_defaults_to_ttt_lr():
     mlp = Qwen3MLP(_cfg(ttt_lr=0.5), layer_idx=0)
     assert mlp.ttt_lr_effective == mlp.ttt_lr == 0.5
+
+
+def _randomize(mlp):
+    with torch.no_grad():
+        for p in mlp.parameters():
+            p.normal_(0.0, 0.1)
+    return mlp.eval()
+
+
+def test_forward_unchanged_when_effective_equals_target():
+    """ttt_lr_effective 默认 == ttt_lr,forward 必须与改动前一致(用 outer 与 nlms 各验)。"""
+    for rule in ("outer", "nlms"):
+        torch.manual_seed(7)
+        mlp = _randomize(Qwen3MLP(_cfg(ttt_write_rule=rule, ttt_lr=0.5, ttt_chunk=2), layer_idx=0))
+        x = torch.randn(1, 4, 8); t = torch.randn(1, 4, 8)
+        with torch.no_grad():
+            out_default = mlp(x, t=t)
+        mlp.ttt_lr_effective = mlp.ttt_lr
+        with torch.no_grad():
+            out_explicit = mlp(x, t=t)
+        torch.testing.assert_close(out_default, out_explicit)
+
+
+def test_forward_scales_with_effective_lr():
+    """改 ttt_lr_effective 必须改变 NLMS 写入(证明 forward 真的用了它而非 ttt_lr)。"""
+    torch.manual_seed(7)
+    mlp = _randomize(Qwen3MLP(_cfg(ttt_write_rule="nlms", ttt_lr=0.5, ttt_chunk=2), layer_idx=0))
+    x = torch.randn(1, 4, 8); t = torch.randn(1, 4, 8)
+    with torch.no_grad():
+        out_full = mlp(x, t=t)
+        mlp.ttt_lr_effective = 0.0
+        out_zero = mlp(x, t=t)
+    assert not torch.allclose(out_full, out_zero), "forward must respond to ttt_lr_effective"

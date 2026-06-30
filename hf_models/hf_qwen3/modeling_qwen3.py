@@ -269,7 +269,7 @@ class Qwen3MLP(nn.Module):
                 resid_i = Vi - pred_i                                # [b, c, d]
                 denom_i = self.ttt_nlms_lambda + (Ki * Ki).sum(dim=-1, keepdim=True)  # [b, c, 1]
                 resid_i = resid_i / denom_i
-                dW_i = contract("b c d, b c h -> b d h", resid_i, Ki) * self.ttt_lr   # [b, d, h_dim]
+                dW_i = contract("b c d, b c h -> b d h", resid_i, Ki) * self.ttt_lr_effective   # [b, d, h_dim]
                 # average the C per-key rank-1 writes over the chunk: applying all C
                 # writes simultaneously against a stale chunk-start S otherwise scales
                 # the combined update ~sqrt(C), causing S to diverge over many chunks.
@@ -293,7 +293,7 @@ class Qwen3MLP(nn.Module):
                 "b t c h, b t c d -> b t d h",
                 h_padded[:, :-1], prediction_states[:, :-1],
             )
-            delta_down_proj = d_down_proj * self.ttt_lr
+            delta_down_proj = d_down_proj * self.ttt_lr_effective
             d_down_proj = torch.cat(
                 [repeat(self.down_proj.weight, "d h -> b 1 d h", b=bs), delta_down_proj],
                 dim=1,
@@ -310,7 +310,7 @@ class Qwen3MLP(nn.Module):
                 "b t c h, b t c d -> b t d h",
                 h_norm_padded[:, :-1], prediction_states[:, :-1],
             )
-            delta_down_proj = d_down_proj * self.ttt_lr
+            delta_down_proj = d_down_proj * self.ttt_lr_effective
             # cumsum over deltas only (W0 handled separately); a leading zero
             # block preserves the same causal offset: chunk t reads sum_{j<t}.
             delta_w_sum = torch.cat(
