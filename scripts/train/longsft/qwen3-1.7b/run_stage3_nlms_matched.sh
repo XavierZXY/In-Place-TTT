@@ -23,6 +23,10 @@ NLMS_DETACH_VALUE="${NLMS_DETACH:-true}"
 # decay gate alpha for NLMS state: S<-(1-a)S+dW, bounds ||S|| to break runaway
 # feedback. Default 0.1 for the nlms arm; 0.0 reproduces pure (diverging) NLMS.
 NLMS_DECAY_VALUE="${NLMS_DECAY:-0.1}"
+# ttt_lr warmup for NLMS cold-start: ttt_lr ramps init->target over N steps.
+# 0 steps = no warmup. Defaults protect the nlms cold-start.
+TTT_LR_WARMUP_STEPS_VALUE="${TTT_LR_WARMUP_STEPS:-200}"
+TTT_LR_WARMUP_INIT_VALUE="${TTT_LR_WARMUP_INIT:-0.001}"
 TTT_TRAIN_ONLY_VALUE="${TTT_TRAIN_ONLY:-true}"
 
 export EXP_NAME="${EXP_NAME:-qwen3-1.7b-stage3-matched-${WRITE_RULE}-lr${TTT_LR_VALUE}}"
@@ -37,7 +41,7 @@ if [[ -z "${MODEL_FOUNDATION_JSON:-}" ]]; then
       export MODEL_FOUNDATION_JSON="{\"ttt_write_rule\": \"outer\", \"ttt_lr\": ${TTT_LR_VALUE}, \"ttt_train_only\": ${TTT_TRAIN_ONLY_VALUE}}"
       ;;
     nlms)
-      export MODEL_FOUNDATION_JSON="{\"ttt_write_rule\": \"nlms\", \"ttt_lr\": ${TTT_LR_VALUE}, \"ttt_nlms_lambda\": ${NLMS_LAMBDA}, \"ttt_nlms_detach_state\": ${NLMS_DETACH_VALUE}, \"ttt_nlms_decay\": ${NLMS_DECAY_VALUE}, \"ttt_train_only\": ${TTT_TRAIN_ONLY_VALUE}}"
+      export MODEL_FOUNDATION_JSON="{\"ttt_write_rule\": \"nlms\", \"ttt_lr\": ${TTT_LR_VALUE}, \"ttt_nlms_lambda\": ${NLMS_LAMBDA}, \"ttt_nlms_detach_state\": ${NLMS_DETACH_VALUE}, \"ttt_nlms_decay\": ${NLMS_DECAY_VALUE}, \"ttt_lr_warmup_steps\": ${TTT_LR_WARMUP_STEPS_VALUE}, \"ttt_lr_warmup_init\": ${TTT_LR_WARMUP_INIT_VALUE}, \"ttt_train_only\": ${TTT_TRAIN_ONLY_VALUE}}"
       ;;
     keynorm)
       export MODEL_FOUNDATION_JSON="{\"ttt_key_norm\": true, \"ttt_lr\": ${TTT_LR_VALUE}, \"ttt_train_only\": ${TTT_TRAIN_ONLY_VALUE}}"
