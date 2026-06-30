@@ -189,6 +189,8 @@ class Qwen3Config(PretrainedConfig):
         ttt_lr=0.3,
         ttt_chunk=8192,
         ttt_target="hidden_states",
+        ttt_write_rule="outer",
+        ttt_nlms_lambda=1.0,
         ttt_compress_window=0,
         ttt_aux_loss_weight=0.0,
         ttt_aux_target="next_input_embed",
@@ -260,6 +262,10 @@ class Qwen3Config(PretrainedConfig):
         self.ttt_key_norm = bool(ttt_key_norm)
         self.ttt_lr = ttt_lr
         self.ttt_chunk = ttt_chunk
+        self.ttt_write_rule = str(ttt_write_rule)
+        if self.ttt_write_rule not in {"outer", "nlms"}:
+            raise ValueError("ttt_write_rule must be one of {'outer', 'nlms'}")
+        self.ttt_nlms_lambda = float(ttt_nlms_lambda)
         self.ttt_target = ttt_target
         if self.ttt_target not in {"hidden_states", "input_embed"}:
             raise ValueError("ttt_target must be one of {'hidden_states', 'input_embed'}")
