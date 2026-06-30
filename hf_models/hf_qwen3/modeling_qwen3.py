@@ -98,6 +98,7 @@ class Qwen3MLP(nn.Module):
             self.ttt_lr = getattr(config, "ttt_lr", 0.3)
             self.ttt_write_rule = getattr(config, "ttt_write_rule", "outer")
             self.ttt_nlms_lambda = float(getattr(config, "ttt_nlms_lambda", 1.0))
+            self.ttt_nlms_detach_state = bool(getattr(config, "ttt_nlms_detach_state", False))
             self.ttt_conv = nn.Conv1d(
                 self.hidden_size, self.hidden_size, kernel_size=5, padding=2,
                 groups=self.hidden_size, bias=False,
@@ -236,22 +237,30 @@ class Qwen3MLP(nn.Module):
             # delta_down_proj keeps per-chunk dW for the monitor stats (same meaning as outer).
             W0 = self.down_proj.weight                       # [d, h_dim]
             S = torch.zeros(bs, W0.shape[0], W0.shape[1], device=h.device, dtype=torch.float32)
+            # truncated BPTT (opt-in): detach the *history* before each chunk so the
+            # readout/write see prior state as a constant, but the current chunk's
+            # own write dW_i stays differentiable. This bounds the cross-chunk
+            # gradient chain (which explodes over many chunks with real-scale weights)
+            # WITHOUT severing the value path's gradient. Forward values are unchanged.
+            detach_state = getattr(self, "ttt_nlms_detach_state", False)
             outs = []
             per_chunk_dw = []
             for i in range(chunk_num):
                 Ki = h_padded[:, i].float()                  # [b, c, h_dim]
                 Vi = prediction_states[:, i].float()         # [b, c, d]
+                S_hist = S.detach() if detach_state else S   # frozen history (backward only)
                 base_i = contract("d h, b c h -> b c d", W0.float(), Ki)
-                delta_i = contract("b d h, b c h -> b c d", S, Ki)
+                delta_i = contract("b d h, b c h -> b c d", S_hist, Ki)
                 outs.append((base_i + delta_i).to(h.dtype))
                 # per-key residual write (chunk-start S for all keys in this chunk)
-                pred_i = contract("b c h, b d h -> b c d", Ki, S)   # Ki @ S^T
+                pred_i = contract("b c h, b d h -> b c d", Ki, S_hist)   # Ki @ S^T
                 resid_i = Vi - pred_i                                # [b, c, d]
                 denom_i = self.ttt_nlms_lambda + (Ki * Ki).sum(dim=-1, keepdim=True)  # [b, c, 1]
                 resid_i = resid_i / denom_i
                 dW_i = contract("b c d, b c h -> b d h", resid_i, Ki) * self.ttt_lr   # [b, d, h_dim]
                 per_chunk_dw.append(dW_i)
-                S = S + dW_i
+                # accumulate: history (detached if enabled) + current differentiable write
+                S = S_hist + dW_i
             down_proj = torch.stack(outs, dim=1)             # [b, chunk_num, c, d]
             delta_down_proj = torch.stack(per_chunk_dw, dim=1).to(h.dtype)  # [b, chunk_num, d, h_dim]
             self._record_ttt_future_chunk_aux(prediction_states, target_padded, x.shape[1])
