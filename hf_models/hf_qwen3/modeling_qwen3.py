@@ -230,6 +230,33 @@ class Qwen3MLP(nn.Module):
             prediction_states = contract("b t c d, d e -> b t c e", t_conv, self.ttt_proj.weight)
         else:
             prediction_states = t_conv
+        if getattr(self, "ttt_write_rule", "outer") == "nlms":
+            # Block residual write (per-key NLMS), chunk-serial loop.
+            # base path uses original h (W0); delta path reads sum_{j<t} of NLMS updates.
+            # delta_down_proj keeps per-chunk dW for the monitor stats (same meaning as outer).
+            W0 = self.down_proj.weight                       # [d, h_dim]
+            S = torch.zeros(bs, W0.shape[0], W0.shape[1], device=h.device, dtype=torch.float32)
+            outs = []
+            per_chunk_dw = []
+            for i in range(chunk_num):
+                Ki = h_padded[:, i].float()                  # [b, c, h_dim]
+                Vi = prediction_states[:, i].float()         # [b, c, d]
+                base_i = contract("d h, b c h -> b c d", W0.float(), Ki)
+                delta_i = contract("b d h, b c h -> b c d", S, Ki)
+                outs.append((base_i + delta_i).to(h.dtype))
+                # per-key residual write (chunk-start S for all keys in this chunk)
+                pred_i = contract("b c h, b d h -> b c d", Ki, S)   # Ki @ S^T
+                resid_i = Vi - pred_i                                # [b, c, d]
+                denom_i = self.ttt_nlms_lambda + (Ki * Ki).sum(dim=-1, keepdim=True)  # [b, c, 1]
+                resid_i = resid_i / denom_i
+                dW_i = contract("b c d, b c h -> b d h", resid_i, Ki) * self.ttt_lr   # [b, d, h_dim]
+                per_chunk_dw.append(dW_i)
+                S = S + dW_i
+            down_proj = torch.stack(outs, dim=1)             # [b, chunk_num, c, d]
+            delta_down_proj = torch.stack(per_chunk_dw, dim=1).to(h.dtype)  # [b, chunk_num, d, h_dim]
+            self._record_ttt_future_chunk_aux(prediction_states, target_padded, x.shape[1])
+            self._record_ttt_monitor_stats(delta_down_proj, h_padded, down_proj)
+            return rearrange(down_proj, "b t c d -> b (t c) d")[:, : x.shape[1], :]
         if not hasattr(self, "ttt_key_norm"):
             # Original fused path — kept verbatim so that disabling key-norm is
             # bit-for-bit identical to the pre-change behavior (the base W0 and

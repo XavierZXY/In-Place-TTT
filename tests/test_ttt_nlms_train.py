@@ -33,3 +33,46 @@ def test_train_mlp_reads_write_rule():
     mlp = Qwen3MLP(_cfg(ttt_write_rule="nlms", ttt_nlms_lambda=2.0), layer_idx=0)
     assert mlp.ttt_write_rule == "nlms"
     assert mlp.ttt_nlms_lambda == 2.0
+
+
+def _randomize(mlp):
+    with torch.no_grad():
+        for p in mlp.parameters():
+            p.normal_(0.0, 0.1)
+    return mlp.eval()
+
+
+def test_train_nlms_matches_inference_nlms():
+    """训练侧 chunk-loop NLMS 必须与推理侧逐-chunk NLMS 在同权重同输入下数值一致。"""
+    torch.manual_seed(0)
+    train_cfg = _cfg(ttt_write_rule="nlms", ttt_lr=0.5, ttt_nlms_lambda=1.0, ttt_chunk=2)
+    inf_cfg = InfConfig(
+        vocab_size=32, hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=4, max_position_embeddings=64,
+        ttt_layers=[0], ttt_mode=True, ttt_proj=True, ttt_lr=0.5, ttt_chunk=2,
+        ttt_target="input_embed", ttt_write_rule="nlms", ttt_nlms_lambda=1.0,
+    )
+    torch.manual_seed(1)
+    train_mlp = _randomize(Qwen3MLP(train_cfg, layer_idx=0))
+    torch.manual_seed(1)
+    inf_mlp = _randomize(InfMLP(inf_cfg, layer_idx=0))
+
+    x = torch.randn(1, 4, 8)   # seq=4 = 2 chunks of size 2
+    t = torch.randn(1, 4, 8)
+    with torch.no_grad():
+        train_out = train_mlp(x, t=t)              # [1,4,8]
+        inf_out, _ = inf_mlp(x, t=t)               # [1,4,8]
+    torch.testing.assert_close(train_out, inf_out, rtol=1e-4, atol=1e-5)
+
+
+def test_train_nlms_eta_zero_is_base():
+    """训练侧 NLMS η=0 必须等于 base MLP(无 fast-weight delta)。"""
+    torch.manual_seed(2)
+    mlp = _randomize(Qwen3MLP(_cfg(ttt_write_rule="nlms", ttt_lr=0.0, ttt_chunk=2), layer_idx=0))
+    x = torch.randn(1, 4, 8)
+    t = torch.randn(1, 4, 8)
+    with torch.no_grad():
+        out = mlp(x, t=t)
+        h = mlp.act_fn(mlp.gate_proj(x)) * mlp.up_proj(x)
+        base = torch.nn.functional.linear(h, mlp.down_proj.weight, mlp.down_proj.bias)
+    torch.testing.assert_close(out, base, rtol=1e-4, atol=1e-5)
