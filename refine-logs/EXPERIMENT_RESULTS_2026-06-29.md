@@ -104,3 +104,36 @@ write_collision 各层 0.45–0.51(层 25 最高 0.51–0.61,eff_rank 最低 131
 4. **更细 write_subchunk**:减小单次写入幅度。
 
 **代码状态**:Task1-7 全部完成并提交(推理/训练 NLMS 实现 + 单测 + 探针 + η标定脚本 + matched CPT wrapper);仅 Task8 的全量 CPT 因发散暂停。
+
+---
+
+# M3 阶段 B 续(2026-06-30):发散修复 + 暴露梯度消失
+
+## 修复 1 — detach_state 梯度断开 bug(commit d712cd7)
+**症状**:加 `ttt_nlms_detach_state=true` 后冒烟 step1 `loss.backward()` 崩
+`RuntimeError: element 0 of tensors does not require grad`。
+**根因**:`ttt_train_only=true` 冻 backbone,ttt_proj/ttt_conv 是唯一可训练参数,其梯度**仅**经跨-chunk 累积 S 链回传。原 detach 实现 readout 也读 detached `S_hist` → dW_i 成孤儿节点 → loss 与全部可训练参数断开。
+**修复**:readout 改读 live `S`(携带上一步可微 dW),write 残差仍读 detached `S_hist`。这是真正的 1-step truncated BPTT:梯度链长度=1 chunk(不爆炸),ttt_proj 仍可训练,forward 数值不变(S==S_hist)。加冻结-backbone 回归测试。
+
+## 冒烟验证(2-GPU 卡6/7, η=0.03, detach=true, 16k, 2步, expandable_segments)
+| 指标 | 上次发散 | 修复后 step1 | step2 |
+|---|---|---|---|
+| grad_norm | **5.7e17** | 0.0000 | 0.0000 |
+| ttt_dw | 1.17e12 | 0.00e+00 | **3.65e-12** |
+| ttt_do | 0.686 | 1.66e-03 | 1.66e-03 |
+| loss | 6.73→18.35 | 5.27 | **4.24**↓ |
+| 完成 | ❌崩 | — | ✅2/2+ckpt |
+
+**✅ 发散彻底消除**:grad_norm 5.7e17→0,ttt_dw 1.17e12→~1e-12,loss 正常下降,端到端跑通 + ckpt 保存。
+**注**:OOM 排查发现集群被外部作业占满 + stage3 变长打包样本达 52k token;`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` + 空闲卡解决。
+
+## ⚠️ 新问题:梯度消失(过度截断)
+`grad_norm≈0`、`ttt_dw≈3.65e-12` → ttt_proj/ttt_conv **实质学不动**。
+1-step truncated BPTT 在 7 TTT 层 + 真实权重尺度下,单 chunk readout 回传的梯度被压到 ~1e-12,优化器基本不更新。**稳定性买来了,代价是 matched CPT 学不动**——直接跑完整 CPT,NLMS 臂≈冻结的随机初始化 ttt_proj,无法公平对比 outer-CPT。
+
+**这是真实方法论权衡,非 bug。** 候选下一步:
+1. **放开截断深度**:k-step truncated BPTT(detach 每 k 个 chunk 而非每 1 个),在稳定与梯度量级间找平衡。
+2. **不 detach + 梯度裁剪**:关 detach,靠 `max_grad_norm`(已=1.0)裁爆炸梯度,看 ttt_dw 是否仍发散。
+3. **S 归一化/衰减**:对累积 S 加 RMSNorm 或衰减门控,从源头限幅(治本)。
+4. **重标 η + warmup**:detach 下梯度小,可大幅提 η(如 0.3~1)+ ttt_lr warmup,补偿被截断的学习信号。
+5. **检查 ttt_aux 是否是主要学习信号**:ttt_aux≈0.026 稳定,主 loss 在降——需确认 loss 下降是否来自 ttt 参数还是其他。
