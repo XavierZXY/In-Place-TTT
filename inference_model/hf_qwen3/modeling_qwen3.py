@@ -106,6 +106,9 @@ class Qwen3MLP(nn.Module):
             else:
                 self.ttt_proj = None
             self.ttt_lr = getattr(config, "ttt_lr", 0.3)
+            self.ttt_write_rule = getattr(config, "ttt_write_rule", "outer")
+            self.ttt_nlms_lambda = float(getattr(config, "ttt_nlms_lambda", 1.0))
+            self.ttt_write_subchunk = int(getattr(config, "ttt_write_subchunk", 0))
             self.ttt_conv = nn.Conv1d(
                 self.hidden_size, self.hidden_size, kernel_size=5, padding=2,
                 groups=self.hidden_size, bias=False,
@@ -170,17 +173,47 @@ class Qwen3MLP(nn.Module):
                 )
             y[0][i] = current_y
             if seq_len % self.ttt_chunk == 0 or i != chunk_num - 1 or update_partial:
+                current_key = current_h if h_norm_padded is None else h_norm_padded[0][i]
+                # current_t is the conv output; value V = current_t @ proj^T (or current_t).
                 if self.ttt_proj is not None:
-                    current_key = current_h if h_norm_padded is None else h_norm_padded[0][i]
-                    dw = (
-                        contract("c h, c d, d e -> e h", current_key, current_t, self.ttt_proj.weight) * self.ttt_lr
-                    )
+                    current_value = contract("c d, d e -> c e", current_t, self.ttt_proj.weight)
                 else:
-                    current_key = current_h if h_norm_padded is None else h_norm_padded[0][i]
-                    dw = contract("c h, c d -> d h", current_key, current_t) * self.ttt_lr
-                current_w = current_w + dw
+                    current_value = current_t
+                current_w = self._apply_ttt_write(current_w, current_key, current_value)
         out = rearrange(y, "b t c d -> b (t c) d")[:, :seq_len, :]
         return out, current_w
+
+    def _apply_ttt_write(self, current_w, key, value):
+        """Update the fast weight from one chunk's (key, value), branching on write rule.
+
+        key:   [c, h_dim]   (= h, the TTT key/query)
+        value: [c, d]       (= ttt_conv(t) @ proj^T)
+        current_w: [d, h_dim]  (= W0 + accumulated delta)
+
+        outer: dW = ttt_lr * value^T key                       (unbounded accumulation)
+        nlms:  R  = value - key @ delta^T ; delta = current_w - W0
+               dW = ttt_lr * R^T key / (lambda + tr(key^T key)) (block residual / delta rule)
+        write_subchunk > 0 splits the chunk into serial sub-blocks (intra-chunk recurrence).
+        """
+        write_rule = getattr(self, "ttt_write_rule", "outer")
+        sub = getattr(self, "ttt_write_subchunk", 0)
+        if sub and sub > 0 and sub < key.shape[0]:
+            for s in range(0, key.shape[0], sub):
+                current_w = self._write_block(current_w, key[s : s + sub], value[s : s + sub], write_rule)
+            return current_w
+        return self._write_block(current_w, key, value, write_rule)
+
+    def _write_block(self, current_w, key, value, write_rule):
+        if write_rule == "nlms":
+            delta = current_w - self.down_proj.weight  # [d, h_dim]
+            pred = contract("c h, d h -> c d", key, delta)  # key @ delta^T
+            residual = value - pred  # [c, d]
+            denom = self.ttt_nlms_lambda + (key * key).sum(dim=-1, keepdim=True)  # [c, 1] per-key
+            residual = residual / denom
+            dw = contract("c d, c h -> d h", residual, key) * self.ttt_lr
+        else:  # outer
+            dw = contract("c h, c d -> d h", key, value) * self.ttt_lr
+        return current_w + dw
 
 
 def rotate_half(x):
