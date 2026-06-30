@@ -44,6 +44,8 @@ from in_place_ttt.ttt_aux.training import (
     configure_ttt_only_trainable_params as _configure_ttt_only_trainable_params,
     get_last_ttt_aux_loss as _get_last_ttt_aux_loss,
     pop_ttt_monitor_stats as _pop_ttt_monitor_stats,
+    ttt_lr_warmup_factor as _ttt_lr_warmup_factor,
+    set_ttt_lr_effective as _set_ttt_lr_effective,
 )
 
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
@@ -663,6 +665,19 @@ def main():
                 logger.info(f"epoch:{epoch} Dataloader restarted at stream_epoch:{stream_epoch}")
 
             global_step += 1
+
+            # ttt_lr warmup: set the effective write-rule lr from the current step.
+            # Stateless (pure fn of global_step) → resume-safe. No-op when
+            # ttt_lr_warmup_steps == 0 (effective stays at target ttt_lr).
+            _ttt_warmup_steps = int(getattr(model_config, "ttt_lr_warmup_steps", 0))
+            if _ttt_warmup_steps > 0:
+                _eff_ttt_lr = _ttt_lr_warmup_factor(
+                    global_step,
+                    _ttt_warmup_steps,
+                    float(getattr(model_config, "ttt_lr_warmup_init", 0.0)),
+                    float(getattr(model_config, "ttt_lr", 0.3)),
+                )
+                _set_ttt_lr_effective(model, _eff_ttt_lr)
 
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
