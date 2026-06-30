@@ -235,3 +235,28 @@ write_collision 各层 0.45–0.51(层 25 最高 0.51–0.61,eff_rank 最低 131
 - **选项 2(治本)**:从 stage1/2 早期就用 NLMS 写规则共同训练 projections,让 ttt_proj/ttt_conv 学到能让 `K·Sᵀ` 预测 V 的表示(残差自然收缩)。代价:重训成本高。
 - **选项 3**:DeltaNet/Gated chunkwise 成熟 form,放弃"纯 NLMS"叙事。
 - 待与用户讨论选型。
+
+---
+
+# M3 路线决策(2026-06-30):选项 2 — stage3 开端用 NLMS 重训 + ttt_lr warmup
+
+## 决策结论(与用户讨论后定型)
+**何时引入 NLMS = stage3 开端。** 理由:`ttt_conv`/`ttt_proj` 只在 stage3 诞生(stage1=hidden-align 4k 无TTT,stage2=KD 8k 无TTT,均 `ttt_mode=false`/`ttt_layers=[]`)。stage3 才 `ttt_mode=true`(6层 [4,10,14,17,22,26], chunk=1024, ttt_lr=3, target=input_embed, outer)。所以唯一能让 projection "从出生就在 NLMS 动力学下学"的锚点就是 stage3 开端——从 stage2 ckpt 起重跑 stage3,但写规则换 NLMS。
+
+**为什么治本**:D/A/C 统一失败根因 = NLMS 在 outer 训出的 ckpt 上 off-distribution(projection 永远不变,残差永不收缩)。只有 projection 从 NLMS 第一步开始学,才能学到"使 K·Sᵀ 预测 V"的表示 → 残差自然收缩 → S 不发散。这是唯一让动力学与写规则匹配的方案。
+
+## 冷启动风险与对策
+**风险(鸡生蛋)**:想靠训练治好发散,但冷启动前几十步 projection 还没学会收缩残差,本身就会发散(= C sweep 的 2.58e36 状态),梯度爆炸会在 projection 学到东西前把它打挂。
+**对策 = ttt_lr warmup**(用户选定,不叠 decay/subchunk/裁剪)。ttt_lr 从极小(~1e-3)warmup 到目标值,冷启动写入压到不发散,撑到 projection 适应后再加大。
+
+## 实现缺口
+当前 `ttt_lr` 是 MLP `__init__` 读的静态标量(modeling_qwen3.py:98),forward 直接乘(:268),**无任何调度机制**。ttt_lr warmup 需新建:训练循环(tasks/train_torch.py 有 global_step @665)按 step 算 warmup 系数 → 注入每个 TTT MLP 的 self.ttt_lr。需走 brainstorm→spec→plan。
+
+## 落地路径(控成本,用户选定)
+全量 stage3 = 10000步 × 64k上下文 × 6 TTT层 × matched双臂,数天多卡。故:
+1. **先实现 ttt_lr warmup**。
+2. **短验证**(4k 长度、几百步):冷启动不发散 + ttt_do 起来(跳出噪声地板)+ ttt_dw 有界。
+3. **成立后才上全量 stage3 matched 双臂重训**(outer-stage3 vs nlms-stage3,同 stage2 起点/同预算)。
+
+## decay gate(方案C)的去留
+C 代码已实现且 23 单测全绿,`ttt_nlms_decay` 默认 0.0(纯 NLMS,不影响现状)。虽 sweep 证伪"在 outer-ckpt 上 drop-in 用 decay 救发散",但作为**冷启动备选打底**仍保留——若 warmup 单独不够,可叠加中等 decay。代码留存无害。
