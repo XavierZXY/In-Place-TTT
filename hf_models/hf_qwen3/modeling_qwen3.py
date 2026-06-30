@@ -248,9 +248,16 @@ class Qwen3MLP(nn.Module):
             for i in range(chunk_num):
                 Ki = h_padded[:, i].float()                  # [b, c, h_dim]
                 Vi = prediction_states[:, i].float()         # [b, c, d]
-                S_hist = S.detach() if detach_state else S   # frozen history (backward only)
+                S_hist = S.detach() if detach_state else S   # write history (constant under detach)
                 base_i = contract("d h, b c h -> b c d", W0.float(), Ki)
-                delta_i = contract("b d h, b c h -> b c d", S_hist, Ki)
+                # readout reads the *live* S (carries the previous chunk's differentiable
+                # dW under detach); write residual reads the detached history. Numerically
+                # S == S_hist (same values), so forward is unchanged in either mode; only
+                # the backward graph differs. This gives 1-step truncated BPTT: each dW_i
+                # earns gradient via the NEXT chunk's readout (chain length = 1 chunk, no
+                # 16-step unroll → no explosion), yet ttt_proj/ttt_conv stay trainable even
+                # with a frozen backbone (ttt_train_only).
+                delta_i = contract("b d h, b c h -> b c d", S, Ki)
                 outs.append((base_i + delta_i).to(h.dtype))
                 # per-key residual write (chunk-start S for all keys in this chunk)
                 pred_i = contract("b c h, b d h -> b c d", Ki, S_hist)   # Ki @ S^T

@@ -110,8 +110,8 @@ def test_nlms_detach_state_forward_identical():
 
 
 def test_nlms_detach_state_changes_gradient():
-    """detach 改变梯度图:full BPTT 的 ttt_proj 梯度非零,detach 截断跨 chunk 历史
-    后 ttt_proj 仅经 base/readout 获梯度(可能为零)。两者梯度图必须不同。"""
+    """detach 改变梯度图:full BPTT 与 1-step truncated BPTT 的 ttt_proj 梯度均非零,
+    但数值不同(detach 截断了更早历史的梯度贡献)。"""
     torch.manual_seed(9)
     x = torch.randn(1, 8, 8); t = torch.randn(1, 8, 8)
     torch.manual_seed(9)
@@ -119,11 +119,39 @@ def test_nlms_detach_state_changes_gradient():
     m_full(x, t=t).float().pow(2).mean().backward()
     g_full = m_full.ttt_proj.weight.grad
     assert g_full is not None and g_full.norm() > 0, "full BPTT must train ttt_proj"
-    # detach: forward identical already covered; here assert it runs with finite grads
     torch.manual_seed(9)
     m_det = _randomize(Qwen3MLP(_cfg(ttt_write_rule="nlms", ttt_lr=0.5, ttt_chunk=2,
                                      ttt_nlms_detach_state=True), layer_idx=0))
     m_det(x, t=t).float().pow(2).mean().backward()
+    g_det = m_det.ttt_proj.weight.grad
+    assert g_det is not None and g_det.norm() > 0, "1-step truncated BPTT must still train ttt_proj"
     for p_ in m_det.parameters():
         if p_.grad is not None:
             assert torch.isfinite(p_.grad).all()
+    # 截断后梯度应与完整 BPTT 不同(否则 detach 无效)
+    assert not torch.allclose(g_full, g_det), "detach must change the gradient"
+
+
+def _freeze_backbone(mlp):
+    """模拟 ttt_train_only:仅 ttt_conv/ttt_proj 可训练,其余冻结。"""
+    for n, p in mlp.named_parameters():
+        p.requires_grad = ("ttt_conv" in n) or ("ttt_proj" in n)
+    return mlp
+
+
+def test_nlms_detach_state_trains_under_frozen_backbone():
+    """回归:matched-CPT 真实条件(冻结 backbone + detach)下,loss 必须可微且
+    ttt_proj/ttt_conv 梯度非零。否则 loss.backward() 崩 'does not require grad'。"""
+    torch.manual_seed(9)
+    x = torch.randn(1, 8, 8); t = torch.randn(1, 8, 8)
+    torch.manual_seed(9)
+    mlp = _randomize(Qwen3MLP(_cfg(ttt_write_rule="nlms", ttt_lr=0.03, ttt_chunk=2,
+                                   ttt_nlms_detach_state=True), layer_idx=0))
+    _freeze_backbone(mlp)
+    loss = mlp(x, t=t).float().pow(2).mean()
+    assert loss.requires_grad, "frozen-backbone NLMS+detach loss must require grad"
+    loss.backward()
+    for name in ("ttt_proj", "ttt_conv"):
+        g = getattr(mlp, name).weight.grad
+        assert g is not None and g.norm() > 0, f"{name} must receive nonzero grad under detach"
+        assert torch.isfinite(g).all()
