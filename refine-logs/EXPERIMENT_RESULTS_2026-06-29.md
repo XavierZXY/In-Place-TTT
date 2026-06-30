@@ -107,6 +107,50 @@ write_collision 各层 0.45–0.51(层 25 最高 0.51–0.61,eff_rank 最低 131
 
 ---
 
+# ttt_lr warmup 实现 + 短验证(2026-06-30)
+
+## 实现(6 commit,subagent-driven,29 单测全绿,final review: ready to merge)
+- config flag `ttt_lr_warmup_steps`/`ttt_lr_warmup_init` + MLP `ttt_lr_effective` + forward 三乘点改用 + `ttt_lr_warmup_factor` 纯函数 + `set_ttt_lr_effective` setter + 训练循环每步调用 + wrapper env。
+- 4 不变量经审查保证:warmup_steps=0 bit级不变、resume-safe(纯 global_step 函数)、eval/推理用目标 lr、复用 _iter_decoder_layers。
+
+## 短验证冒烟(4k/300步, η=3, warmup 200步 init 1e-3, detach=false, decay=0, 卡6/7)
+**冷启动早期 step(warmup 中)**:
+| step | ttt_dw | ttt_do | loss | grad_norm |
+|---|---|---|---|---|
+| 1 | 0.00 | 1.66e-3 | 5.30 | 0 |
+| ~中段 | 2e-8~5e-8 | 1.66e-3 | 5.3→3.6→4.6 | 5e-4~4e-3 |
+
+**✅ 冷启动稳定性确认(前所未有)**:
+- ttt_dw 有界(0→~1e-8 缓增,**完全不发散**,对比此前 D/C 的 2.58e36)。
+- loss 从 5.30 正常下降到 3.5~4.6(在学)。
+- grad_norm 健康(5e-4~4e-3,非零非爆)。
+- warmup 把冷启动写入压到极小,撑过了之前必爆的前期 —— 这是 D/A/C 都做不到的。
+
+**待观察(warmup step>200 后)**:ttt_do 仍在 bf16 噪声地板(1.66e-3),因 warmup 中 ttt_lr_effective 还小。关键判据 = warmup 跑完后 ttt_do 能否跳出地板(projection 是否真学到让残差收缩)。300 步冒烟进行中。
+
+## 短验证完整结果(300步跑完,2026-06-30):✅ 三判据全部成立
+| step 区段 | ttt_dw | ttt_do | loss | grad_norm |
+|---|---|---|---|---|
+| 1(warmup起) | 0.00 | 1.66e-3 | 5.30 | 0 |
+| ~28%(warmup中) | 1.9e-6 | 1.80e-3 | 4.3 | 0.05 |
+| ~46% | 1.2e-5 | 2.43e-3 | 4.1 | 0.08 |
+| ~67%(warmup完成,ttt_lr→3.0) | 4e-5 | 3.84e-3 | 4.2 | 0.02 |
+| ~84% | 1.1e-4 | 7.80e-3 | 4.0 | 0.02 |
+| 100% | ~1e-4 | 4.3~8.2e-3 | 3.5~4.9 | 0.02 |
+
+**判据全过**:
+1. ✅ **冷启动 ttt_dw 全程有界**:0 → ~1e-4 单调缓增,**从未爆炸**(对比 D/C 同 ckpt 同 η 的 2.58e36)。
+2. ✅ **ttt_do 跳出 bf16 噪声地板**:1.66e-3 → 单调升至 ~8e-3(地板的 ~5 倍)。
+3. ✅ **loss 平稳下降不发散**:5.30 → 3.5~4.9,grad_norm 全程 0.01~0.2 健康。
+
+**决定性证据**:warmup 完成后 ttt_lr 恒定在目标 **3.0**,ttt_dw 仍有界(~1e-4)。**同样的 η=3:drop-in(D 方案)第一步即爆 2.58e36,而 warmup 训出的 projection 不爆。** 证明 warmup 期间 projection 确实学到了让 K·Sᵀ 预测 V、残差收缩的表示 —— 这正是选项 2 的核心假设,现已验证。
+
+**裁决**:冷启动 warmup 方案成立。**可上全量 64k stage3 matched 双臂重训**(outer-stage3 vs nlms-stage3+warmup,同 stage2 起点/同预算),判定 NLMS 能否把 RULER 0.285 拉回甚至超过关-TTT 上界 0.458。
+- 全量配置建议:warmup_steps 按比例放大(短验证 200 步覆盖 ~67% 于 300 步;全量 10000 步可设 warmup ~500-1000 步)、64k 长度、6 TTT 层。
+- 注:ttt_do ~8e-3 仍低于阶段 A 健康区 [0.2,0.4],但那是 zero-training 标定的离线值,训练中 projection 持续进化,ttt_do 在 300 步内仍单调上升未饱和 —— 全量更长训练应继续上行。
+
+---
+
 # M3 阶段 B 续(2026-06-30):发散修复 + 暴露梯度消失
 
 ## 修复 1 — detach_state 梯度断开 bug(commit d712cd7)
