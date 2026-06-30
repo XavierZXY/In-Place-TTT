@@ -23,7 +23,7 @@
 #
 # Overridable env (with defaults):
 #   GPUS=0,1,2,3,4,5,6,7   MAX_STEPS=10000   SAVE_STEPS=3000
-#   TTT_LR=3   TTT_LR_WARMUP_STEPS=1000   TTT_LR_WARMUP_INIT=0.001
+#   TTT_LR=3   TTT_LR_WARMUP_STEPS=500   TTT_LR_WARMUP_INIT=0.001
 #   EVAL_LENGTHS="4096 8192 16384"   EVAL_N_PER_TASK=50
 # =============================================================================
 set -euo pipefail
@@ -37,7 +37,7 @@ PHASE="${PHASE:-all}"                       # all | train | merge | eval
 GPUS="${GPUS:-0,1,2,3,4,5,6,7}"             # 8-GPU single arm
 
 # Experiment identity
-EXP_NAME="${EXP_NAME:-qwen3-1.7b-stage3-nlms-full-w1000}"
+EXP_NAME="${EXP_NAME:-qwen3-1.7b-stage3-nlms-full-w500}"
 export EXP_NAME
 OUTPUT_DIR="$REPO_ROOT/outputs/$EXP_NAME"
 
@@ -47,7 +47,7 @@ SAVE_STEPS="${SAVE_STEPS:-3000}"
 
 # NLMS write rule + cold-start stabilization
 TTT_LR="${TTT_LR:-3}"
-TTT_LR_WARMUP_STEPS="${TTT_LR_WARMUP_STEPS:-1000}"
+TTT_LR_WARMUP_STEPS="${TTT_LR_WARMUP_STEPS:-500}"
 TTT_LR_WARMUP_INIT="${TTT_LR_WARMUP_INIT:-0.001}"
 NLMS_DECAY="${NLMS_DECAY:-0.0}"             # warmup alone proved sufficient in 4k/300 smoke
 NLMS_DETACH="${NLMS_DETACH:-false}"         # full BPTT (warmup keeps grads bounded)
@@ -180,3 +180,7 @@ case "$PHASE" in
 esac
 
 echo "[pipeline] PHASE=$PHASE complete."
+
+# PHASE=train bash .../run_stage3_nlms_full.sh   # 8卡训练
+# PHASE=merge bash .../run_stage3_nlms_full.sh   # 转HF
+# PHASE=eval  bash .../run_stage3_nlms_full.sh   # RULER eval
