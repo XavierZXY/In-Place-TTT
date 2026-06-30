@@ -79,3 +79,28 @@ write_collision 各层 0.45–0.51(层 25 最高 0.51–0.61,eff_rank 最低 131
 - 但映射极陡且不稳:η≤0.01 几乎不写(~disable-ttt),η=0.03 已到 0.30,η≥0.1 发散为 NaN。5 样本子集里 η=0.03 曾测出 1.0(高方差)。
 - **根因(符合 research-refine R2 预测)**:此 ckpt 的 ttt_proj/ttt_conv 在 outer 动力学下训练,per-key NLMS 读出 K·Sᵀ 不能预测 V → 残差不收缩 → S 在 16 chunk 上发散。**这正是 zero-training drop-in off-distribution、不能判定方法的证据。**
 - **结论**:η=0.03 作为 matched CPT 的初始 η;但真正判定必须靠 matched CPT(在 NLMS 动力学下训练 projections),drop-in 不可信。matched CPT 建议同时试 η∈{0.01, 0.03, 0.1},因训练会改变 projections 使稳定区间右移。
+
+---
+
+# M3 阶段 B 受阻:NLMS 训练数值发散(2026-06-30)
+
+**2-GPU FSDP 冒烟**(NLMS, η=0.03, 16k=16chunk, 从 stage2/gs8000 起, 2 步):
+- 训练**能端到端跑**(forward+backward+ckpt 保存,FSDP 下 NLMS chunk-loop 工作)。
+- 但**立即数值发散**:
+  - step1: `ttt_dw=0.00e+00`, `grad_norm=5.7e17`(梯度爆炸,裁剪前)
+  - step2: `ttt_dw=1.17e+12`(fast-weight 增量爆炸), `ttt_do=0.686`, loss 6.73→18.35
+- 注:单 GPU 因 `init_device=meta` 需 FSDP 而失败,须 ≥2 GPU。
+
+**诊断**:
+- 与阶段 A 零训练 sweep 一致——per-key NLMS 在 16-chunk 无界 S 累加下不稳:η=0.03 已是 output_delta 临界点,训练 1 步后 optimizer 把 ttt_conv/proj 推入发散区。
+- 小尺度玩具测试(hid=128, 随机 init 0.02)梯度稳定且对 η 不敏感→发散源于真实权重尺度(‖h‖≈71)+ 真实 V 尺度 + 16 chunk 深度,非代码 bug。
+- 根因:NLMS 读出 `K·Sᵀ` 在 S 无界累加下随 chunk 深度放大;backward 穿过 16 步串行图进一步放大梯度。
+
+**结论**:per-key NLMS 的"chunk 间串行+chunk 内批量近似"版本在当前架构(chunk=1024, 16 chunk @16k)训练不稳定,不能直接跑 matched CPT。需要稳定化改造再继续:
+候选(下一轮设计):
+1. **S 归一化/衰减**:对累积 S 加 RMSNorm 或衰减门控(回到 decay 方向,但这次治的是训练稳定性)。
+2. **更小 η + warmup**:η<0.003 起步,或 ttt_lr warmup。
+3. **detach 跨 chunk 的 S**(truncated BPTT):backward 不穿透全部 16 chunk,切断梯度爆炸链。← 最可能有效且最小改动。
+4. **更细 write_subchunk**:减小单次写入幅度。
+
+**代码状态**:Task1-7 全部完成并提交(推理/训练 NLMS 实现 + 单测 + 探针 + η标定脚本 + matched CPT wrapper);仅 Task8 的全量 CPT 因发散暂停。
