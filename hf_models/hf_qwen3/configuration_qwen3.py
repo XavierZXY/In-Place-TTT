@@ -193,6 +193,8 @@ class Qwen3Config(PretrainedConfig):
         ttt_nlms_lambda=1.0,
         ttt_nlms_detach_state=False,
         ttt_nlms_decay=0.0,
+        ttt_lr_warmup_steps=0,
+        ttt_lr_warmup_init=0.0,
         ttt_compress_window=0,
         ttt_aux_loss_weight=0.0,
         ttt_aux_target="next_input_embed",
@@ -275,6 +277,15 @@ class Qwen3Config(PretrainedConfig):
         self.ttt_nlms_decay = float(ttt_nlms_decay)
         if not (0.0 <= self.ttt_nlms_decay < 1.0):
             raise ValueError("ttt_nlms_decay must be in [0.0, 1.0)")
+        # Linear warmup for the TTT write-rule lr (ttt_lr): protects the NLMS
+        # cold-start (projections not yet converging residuals) from divergence.
+        # warmup_steps=0 → no warmup (ttt_lr_effective == ttt_lr, bit-identical).
+        self.ttt_lr_warmup_steps = int(ttt_lr_warmup_steps)
+        if self.ttt_lr_warmup_steps < 0:
+            raise ValueError("ttt_lr_warmup_steps must be >= 0")
+        self.ttt_lr_warmup_init = float(ttt_lr_warmup_init)
+        if self.ttt_lr_warmup_init < 0:
+            raise ValueError("ttt_lr_warmup_init must be >= 0")
         self.ttt_target = ttt_target
         if self.ttt_target not in {"hidden_states", "input_embed"}:
             raise ValueError("ttt_target must be one of {'hidden_states', 'input_embed'}")
