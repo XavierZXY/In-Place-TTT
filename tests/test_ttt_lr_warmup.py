@@ -31,3 +31,8 @@ def test_config_warmup_defaults_and_validation():
         _cfg(ttt_lr_warmup_steps=-1)
     with pytest.raises(ValueError):
         _cfg(ttt_lr_warmup_init=-0.5)
+
+
+def test_mlp_ttt_lr_effective_defaults_to_ttt_lr():
+    mlp = Qwen3MLP(_cfg(ttt_lr=0.5), layer_idx=0)
+    assert mlp.ttt_lr_effective == mlp.ttt_lr == 0.5
