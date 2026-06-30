@@ -16,6 +16,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WRITE_RULE="${WRITE_RULE:-outer}"
 TTT_LR_VALUE="${TTT_LR:-3}"
 NLMS_LAMBDA="${NLMS_LAMBDA:-1.0}"
+# truncated BPTT: detach cross-chunk history so backward does not unroll all
+# chunks (the gradient-explosion fix). On by default for the nlms arm; set
+# NLMS_DETACH=false to reproduce the un-truncated (diverging) baseline.
+NLMS_DETACH_VALUE="${NLMS_DETACH:-true}"
+# decay gate alpha for NLMS state: S<-(1-a)S+dW, bounds ||S|| to break runaway
+# feedback. Default 0.1 for the nlms arm; 0.0 reproduces pure (diverging) NLMS.
+NLMS_DECAY_VALUE="${NLMS_DECAY:-0.1}"
 TTT_TRAIN_ONLY_VALUE="${TTT_TRAIN_ONLY:-true}"
 
 export EXP_NAME="${EXP_NAME:-qwen3-1.7b-stage3-matched-${WRITE_RULE}-lr${TTT_LR_VALUE}}"
@@ -30,7 +37,7 @@ if [[ -z "${MODEL_FOUNDATION_JSON:-}" ]]; then
       export MODEL_FOUNDATION_JSON="{\"ttt_write_rule\": \"outer\", \"ttt_lr\": ${TTT_LR_VALUE}, \"ttt_train_only\": ${TTT_TRAIN_ONLY_VALUE}}"
       ;;
     nlms)
-      export MODEL_FOUNDATION_JSON="{\"ttt_write_rule\": \"nlms\", \"ttt_lr\": ${TTT_LR_VALUE}, \"ttt_nlms_lambda\": ${NLMS_LAMBDA}, \"ttt_train_only\": ${TTT_TRAIN_ONLY_VALUE}}"
+      export MODEL_FOUNDATION_JSON="{\"ttt_write_rule\": \"nlms\", \"ttt_lr\": ${TTT_LR_VALUE}, \"ttt_nlms_lambda\": ${NLMS_LAMBDA}, \"ttt_nlms_detach_state\": ${NLMS_DETACH_VALUE}, \"ttt_nlms_decay\": ${NLMS_DECAY_VALUE}, \"ttt_train_only\": ${TTT_TRAIN_ONLY_VALUE}}"
       ;;
     keynorm)
       export MODEL_FOUNDATION_JSON="{\"ttt_key_norm\": true, \"ttt_lr\": ${TTT_LR_VALUE}, \"ttt_train_only\": ${TTT_TRAIN_ONLY_VALUE}}"
