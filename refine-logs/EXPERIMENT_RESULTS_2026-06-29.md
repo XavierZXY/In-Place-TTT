@@ -179,3 +179,38 @@ write_collision 各层 0.45–0.51(层 25 最高 0.51–0.61,eff_rank 最低 131
 - 死结三因素:① off-dist projections 残差不收缩反放大 ② 健康写入需 ~150× 当前量级 ③ 稳定补丁 `/chunk_size`(≈1000×)又压低写入。**"可学"的 η 与"稳定"的 η 无交集。**
 
 **裁决 → 转 C**:A(k-step 截断)只动 backward,对 forward 侧 S 累加爆炸(ttt_dw)无效;C(对 S 加 RMSNorm/衰减)动 forward,直接打断 runaway 正反馈,让大 η 可用——治本。
+
+---
+
+# M3 阶段 B 续3(2026-06-30):C(decay gate)实现完成 + 首轮冒烟暴露 bf16 溢出嫌疑
+
+## C 代码实现(commit 链 Task1-6,全部 TDD 通过,23 单测绿)
+- 两侧 config flag `ttt_nlms_decay`(默认 0.0,校验 [0,1))+ 两侧 MLP 读取。
+- 训练侧 forward:`S = (1-α)·S_hist + dW_i`(line 278)。
+- 推理侧 `_write_block`:`return W0 + (1-α)·ΔW + dw`(decay 只作用 ΔW,不碰 W0)。
+- α=0 逐位退化为纯 NLMS(训推均验证);decay>0 训推一致(α=0.2);冻结 backbone 梯度非零(α=0.1,不 detach)。
+- wrapper 加 `NLMS_DECAY` env(默认 0.1)。
+
+## C 首轮冒烟:η=5, α=0.1, detach=false(卡6/7, 2步)
+| 指标 | C(η=5,α=0.1) | 对比 D(η=5,α=0) |
+|---|---|---|
+| ttt_dw | **2.58e+36** | 2.58e+36(**逐位相同!**) |
+| ttt_do | 9.43e-2 | 9.37e-2 |
+| loss | 7.01↑ | 7.07↑ |
+| grad_norm | 635(detach=false 梯度回来但爆) | 3e-4(detach=true) |
+
+## ⚠️ 关键反常:decay=0 与 decay=0.1 的 ttt_dw 逐位相同(2.58e36)
+两条不同 forward 路径(纯累加 vs 0.9 衰减)给出**完全相同**的天文数字 → 数学上不可能是巧合。
+**新假设:`2.58e36` 不是算出的发散值,而是 bf16 上溢后的饱和/固定常量。** 真实 ckpt 在 η=5 第一个 chunk 的 resid/dW 即 bf16 溢出,(1-α) 系数作用在已饱和值上无意义 → decay 救不回。
+- 注:`ttt_dw` = monitor 的 `delta_weight_sample_ratio` = **per-chunk dW_i 范数 / W0 范数**(非累积 S)。decay 限的是 S 累加,不直接改 dW_i;dW_i 爆炸源于 resid=V−K·S_histᵀ 在 S_hist 大时被放大,但若首 chunk 即溢出,decay 无从介入。
+- toy(随机 K/V,真实尺度,η=5/α=0.1~0.9)全部有界 ‖dW‖≈0.64 → 再次确认 toy 无法复现真实对抗性反馈/溢出(spec 风险节已述)。
+
+## 架构性障碍(systematic-debugging Phase 4.5)
+连续 3+ 轮(D 的 η=5、C 的 α=0.1)均撞同一墙:真实 ckpt η=5 立即爆固定值 2.58e36,toy 无法复现。这不是参数调节(α/η)能解的——指向更深的架构问题:
+- **要么** bf16 精度不足以承载 NLMS 在此尺度的中间量(需 fp32 S + fp32 resid 全程,或更小 η 起步);
+- **要么** off-distribution projections 的对抗反馈太强,任何 forward 限幅都需配合"在 NLMS 动力学下重训 projections"(即 matched CPT 本身,但它又需要先稳定——鸡生蛋)。
+
+**待与用户讨论的下一步候选(不再盲调 α/η)**:
+1. 先验证 bf16 溢出假设:打印真实 ckpt 首 chunk 的 resid/dW 数值范围(加诊断,read-only)。若溢出 → 全 fp32 路径或 resid clip。
+2. 小 η 起步 + decay:η=0.3~1(已知 forward 有界区)+ α=0.3,看 decay 能否让"有界但学得动"——D 证明 η≤1 写入埋噪声地板,但 decay 改变动力学,可能 ttt_do 上移。
+3. 回到 motivation 层:NLMS 在 outer-ckpt 上 drop-in 本就 off-distribution(阶段 A 早已预测),或许应放弃"在 outer-ckpt 上 matched CPT",改为从更早 stage、用更温和的写规则共同训练。
