@@ -193,6 +193,125 @@ def probe_keynorm_effect(captured: dict[int, torch.Tensor], eps: float = 1e-6) -
 
 
 # --------------------------------------------------------------------------- #
+# Probe D: capacity / collision law (R006 — predict RULER failure)
+#   These are the metrics the experiment plan tracks to test whether memory
+#   cross-talk predicts retrieval failure.
+# --------------------------------------------------------------------------- #
+def effective_rank(h: torch.Tensor, eps: float = 1e-12) -> float:
+    """Spectral entropy (exp of Shannon entropy of normalized singular values^2).
+
+    h: [seq, d] key matrix. Full for orthonormal keys, ~1 for collinear keys.
+    """
+    hf = h.float()
+    # singular values of the key matrix; s^2 are the eigenvalues of the Gram.
+    s = torch.linalg.svdvals(hf)
+    p = (s * s)
+    total = p.sum().clamp_min(eps)
+    p = (p / total).clamp_min(eps)
+    entropy = -(p * p.log()).sum()
+    return float(entropy.exp())
+
+
+def write_collision(h: torch.Tensor, eps: float = 1e-12) -> float:
+    """Mean fraction of each key's energy already spanned by the earlier keys.
+
+    For key i, project onto the span of keys[:i] and measure ||proj||^2/||k_i||^2.
+    ~0 for orthogonal keys, ~1 for collinear keys. Causal: key i only sees k<i.
+
+    Implemented with an incremental orthonormal basis (modified Gram-Schmidt):
+    collision_i = 1 - ||k_i - sum_b (k_i . b) b||^2 / ||k_i||^2, where {b} is the
+    orthonormal basis of span(keys[:i]). This is exact and O(seq * d * rank),
+    vastly faster than a per-key lstsq loop.
+    """
+    hf = h.float()
+    n = hf.shape[0]
+    if n < 2:
+        return 0.0
+    d = hf.shape[1]
+    basis = torch.zeros(0, d, dtype=hf.dtype, device=hf.device)  # [rank, d] orthonormal rows
+    collisions: list[float] = []
+    for i in range(n):
+        ki = hf[i]
+        norm2 = (ki * ki).sum()
+        if norm2 <= eps:
+            new_dir = ki  # degenerate; nothing to add
+        else:
+            if basis.shape[0] > 0:
+                coeffs = basis @ ki                       # [rank]
+                proj = coeffs @ basis                     # [d]
+                residual = ki - proj
+                if i >= 1:
+                    proj_energy = (proj * proj).sum() / norm2
+                    collisions.append(float(proj_energy.clamp(0.0, 1.0)))
+            else:
+                residual = ki
+            # extend the basis with the (normalized) residual direction
+            r_norm = residual.norm()
+            if r_norm > 1e-6:
+                basis = torch.cat([basis, (residual / r_norm).unsqueeze(0)], dim=0)
+    return sum(collisions) / len(collisions) if collisions else 0.0
+
+
+def nlms_output_delta_for_etas(K, V, W0, etas, lam=1.0):
+    """Offline per-key NLMS readout: relative output_delta vs base, per eta.
+
+    K: [chunk_num, c, h_dim] keys (= h) per chunk
+    V: [chunk_num, c, d]     values (= ttt_proj(ttt_conv(t))) per chunk
+    W0: [d, h_dim]           base down_proj weight
+    Returns {eta: mean ||delta_out|| / ||out|| over chunks}.
+    """
+    import torch
+    Kf = K.float(); Vf = V.float(); W0f = W0.float()
+    chunk_num = Kf.shape[0]
+    out = {}
+    for eta in etas:
+        S = torch.zeros_like(W0f)              # [d, h_dim]
+        num = 0.0; den = 0.0
+        for i in range(chunk_num):
+            Ki = Kf[i]; Vi = Vf[i]             # [c, h_dim], [c, d]
+            base_i = torch.einsum("d h, c h -> c d", W0f, Ki)
+            delta_i = torch.einsum("c h, d h -> c d", Ki, S)
+            out_i = base_i + delta_i
+            num += float((out_i - base_i).norm())
+            den += float(out_i.norm().clamp_min(1e-12))
+            # per-key residual write
+            pred_i = torch.einsum("c h, d h -> c d", Ki, S)
+            resid_i = (Vi - pred_i) / (lam + (Ki * Ki).sum(dim=-1, keepdim=True))
+            S = S + eta * torch.einsum("c d, c h -> d h", resid_i, Ki)
+        out[eta] = num / max(den, 1e-12)
+    return out
+
+
+def probe_capacity_law(
+    captured: dict[int, torch.Tensor], rank_cap: int = 2048, collision_cap: int = 256
+) -> dict[int, dict[str, float]]:
+    """Per-TTT-layer capacity metrics from the captured key h (single sample).
+
+    effective_rank uses a fast SVD (cap rank_cap rows). write_collision runs an
+    O(seq^2 * d) Gram-Schmidt loop, so it is computed on an evenly-strided
+    subsample of collision_cap keys — a representative slice that preserves the
+    cross-talk structure while staying bounded for 16k/32k sequences.
+    """
+    out: dict[int, dict[str, float]] = {}
+    for layer_idx, h in captured.items():
+        hf = h.float()[0]               # [seq, d]
+        seq = hf.shape[0]
+        if seq < 2:
+            continue
+        rank_slice = hf[:rank_cap]
+        if seq > collision_cap:
+            idx = torch.linspace(0, seq - 1, collision_cap).long()
+            coll_slice = hf[idx]
+        else:
+            coll_slice = hf
+        out[layer_idx] = {
+            "effective_rank": effective_rank(rank_slice),
+            "write_collision": write_collision(coll_slice),
+        }
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Probe C: delta strength vs context length (hypothesis 1 vs 3)
 # Reads the model's own monitor stats already wired into the forward.
 # --------------------------------------------------------------------------- #
@@ -261,8 +380,10 @@ def main() -> None:
         agg_hnorm: dict[int, list[dict[str, float]]] = {}
         agg_keyeff: dict[int, list[dict[str, float]]] = {}
         agg_monitor: dict[int, list[dict[str, float]]] = {}
+        agg_capacity: dict[int, list[dict[str, float]]] = {}
+        per_sample_capacity: list[dict[str, Any]] = []
 
-        for text in samples:
+        for sample_idx, text in enumerate(samples):
             ids = tokenizer(text, return_tensors="pt", truncation=True, max_length=length)
             input_ids = ids["input_ids"].to(args.device)
             if input_ids.shape[1] < 2:
@@ -281,6 +402,11 @@ def main() -> None:
                 agg_keyeff.setdefault(li, []).append(st)
             for li, st in pop_monitor_stats(model).items():
                 agg_monitor.setdefault(li, []).append(st)
+            cap_stats = probe_capacity_law(capture.captured)
+            for li, st in cap_stats.items():
+                agg_capacity.setdefault(li, []).append(st)
+            # per-sample record (for joining with RULER correctness → AUC downstream)
+            per_sample_capacity.append({"sample_index": sample_idx, "by_layer": cap_stats})
 
         def _mean(rows: list[dict[str, float]]) -> dict[str, float]:
             if not rows:
@@ -292,6 +418,8 @@ def main() -> None:
             "probe_a_h_norm": {li: _mean(rows) for li, rows in sorted(agg_hnorm.items())},
             "probe_b_keynorm_effect": {li: _mean(rows) for li, rows in sorted(agg_keyeff.items())},
             "probe_c_delta_strength": {li: _mean(rows) for li, rows in sorted(agg_monitor.items())},
+            "probe_d_capacity_law": {li: _mean(rows) for li, rows in sorted(agg_capacity.items())},
+            "probe_d_per_sample": per_sample_capacity,
         }
         print(f"[length={length}] processed {len(samples)} samples")
 
