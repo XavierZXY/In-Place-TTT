@@ -108,6 +108,7 @@ class Qwen3MLP(nn.Module):
             self.ttt_lr = getattr(config, "ttt_lr", 0.3)
             self.ttt_write_rule = getattr(config, "ttt_write_rule", "outer")
             self.ttt_nlms_lambda = float(getattr(config, "ttt_nlms_lambda", 1.0))
+            self.ttt_nlms_decay = float(getattr(config, "ttt_nlms_decay", 0.0))
             self.ttt_write_subchunk = int(getattr(config, "ttt_write_subchunk", 0))
             self.ttt_conv = nn.Conv1d(
                 self.hidden_size, self.hidden_size, kernel_size=5, padding=2,

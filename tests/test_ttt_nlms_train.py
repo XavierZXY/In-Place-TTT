@@ -172,3 +172,10 @@ def test_nlms_decay_flag_declared_and_validated():
         _cfg(ttt_nlms_decay=1.0)
     with pytest.raises(ValueError):
         _cfg(ttt_nlms_decay=-0.1)
+
+
+def test_train_mlp_reads_decay():
+    mlp = Qwen3MLP(_cfg(ttt_write_rule="nlms", ttt_nlms_decay=0.1), layer_idx=0)
+    assert mlp.ttt_nlms_decay == 0.1
+    # 默认 0.0
+    assert Qwen3MLP(_cfg(ttt_write_rule="nlms"), layer_idx=0).ttt_nlms_decay == 0.0
