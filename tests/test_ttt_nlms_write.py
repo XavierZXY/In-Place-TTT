@@ -158,3 +158,66 @@ def test_write_subchunk_changes_computation():
     # normalization the gap is smaller but still non-zero — assert it is detectable.
     max_diff = (w_block - w_sub).abs().max().item()
     assert max_diff > 1e-5, f"subchunk should alter the recurrence, got max_diff={max_diff}"
+
+
+def test_inference_nlms_decay_zero_is_pure_nlms():
+    """推理侧 ttt_nlms_decay=0.0 的 _write_block 必须与无 decay 的纯 NLMS 逐位相同。"""
+    import torch
+    from inference_model.hf_qwen3.configuration_qwen3 import Qwen3Config
+    from inference_model.hf_qwen3.modeling_qwen3 import Qwen3MLP
+    def mk(decay):
+        cfg = Qwen3Config(
+            vocab_size=32, hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+            num_attention_heads=2, num_key_value_heads=1, head_dim=4, max_position_embeddings=64,
+            ttt_layers=[0], ttt_mode=True, ttt_proj=True, ttt_lr=0.5, ttt_chunk=2,
+            ttt_target="input_embed", ttt_write_rule="nlms", ttt_nlms_lambda=1.0,
+            ttt_nlms_decay=decay,
+        )
+        torch.manual_seed(1)
+        mlp = Qwen3MLP(cfg, layer_idx=0)
+        with torch.no_grad():
+            for p in mlp.parameters():
+                p.normal_(0.0, 0.1)
+        return mlp.eval()
+    mlp_pure = mk(0.0)
+    key = torch.randn(4, mlp_pure.down_proj.weight.shape[1])
+    value = torch.randn(4, mlp_pure.down_proj.weight.shape[0])
+    w0 = mlp_pure.down_proj.weight.clone()
+    # 两次连续写入，确认 decay=0 与纯累加一致
+    w_pure = mlp_pure._apply_ttt_write(w0.clone(), key, value)
+    w_pure = mlp_pure._apply_ttt_write(w_pure, key, value)
+    mlp_d0 = mk(0.0)
+    w_d0 = mlp_d0._apply_ttt_write(w0.clone(), key, value)
+    w_d0 = mlp_d0._apply_ttt_write(w_d0, key, value)
+    torch.testing.assert_close(w_pure, w_d0)
+
+
+def test_inference_nlms_decay_shrinks_delta():
+    """decay>0 时第二次写入前 ΔW 应被 (1-α) 缩小：连续写同样 (k,v)，
+    decay>0 的累积 ΔW 必须小于 decay=0 的累积 ΔW。"""
+    import torch
+    from inference_model.hf_qwen3.configuration_qwen3 import Qwen3Config
+    from inference_model.hf_qwen3.modeling_qwen3 import Qwen3MLP
+    def mk(decay):
+        cfg = Qwen3Config(
+            vocab_size=32, hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+            num_attention_heads=2, num_key_value_heads=1, head_dim=4, max_position_embeddings=64,
+            ttt_layers=[0], ttt_mode=True, ttt_proj=True, ttt_lr=0.5, ttt_chunk=2,
+            ttt_target="input_embed", ttt_write_rule="nlms", ttt_nlms_lambda=1.0,
+            ttt_nlms_decay=decay,
+        )
+        torch.manual_seed(1)
+        mlp = Qwen3MLP(cfg, layer_idx=0)
+        with torch.no_grad():
+            for p in mlp.parameters():
+                p.normal_(0.0, 0.1)
+        return mlp.eval()
+    torch.manual_seed(2)
+    mlp0, mlpd = mk(0.0), mk(0.3)
+    w0 = mlp0.down_proj.weight.clone()
+    key = torch.randn(4, w0.shape[1]); value = torch.randn(4, w0.shape[0])
+    w0_acc = mlp0._apply_ttt_write(mlp0._apply_ttt_write(w0.clone(), key, value), key, value)
+    wd_acc = mlpd._apply_ttt_write(mlpd._apply_ttt_write(w0.clone(), key, value), key, value)
+    d0 = (w0_acc - w0).norm()
+    dd = (wd_acc - w0).norm()
+    assert dd < d0, f"decay should shrink accumulated delta: decay0={d0}, decay0.3={dd}"

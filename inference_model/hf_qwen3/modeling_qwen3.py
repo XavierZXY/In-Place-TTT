@@ -214,6 +214,10 @@ class Qwen3MLP(nn.Module):
             dw = contract("c d, c h -> d h", residual, key) * self.ttt_lr
             # average per-key writes over the chunk (matches training; bounds S growth)
             dw = dw / key.shape[0]
+            # decay gate: ΔW <- (1-α)·ΔW + dw (decay only on the delta, not W0).
+            # decay=0 → current_w + dw (bit-identical pure NLMS).
+            decay = getattr(self, "ttt_nlms_decay", 0.0)
+            return self.down_proj.weight + (1.0 - decay) * delta + dw
         else:  # outer
             dw = contract("c h, c d -> d h", key, value) * self.ttt_lr
         return current_w + dw
