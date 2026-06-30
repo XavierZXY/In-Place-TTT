@@ -271,8 +271,11 @@ class Qwen3MLP(nn.Module):
                 # the combined update ~sqrt(C), causing S to diverge over many chunks.
                 dW_i = dW_i / Ki.shape[1]
                 per_chunk_dw.append(dW_i)
-                # accumulate: history (detached if enabled) + current differentiable write
-                S = S_hist + dW_i
+                # accumulate with decay gate: (1-α)·history + current write.
+                # decay=0 → pure NLMS (S = S_hist + dW_i, bit-identical to before);
+                # decay>0 → ‖S‖ bounded (~‖dW‖/α), breaks runaway feedback, and the
+                # cross-chunk gradient chain decays as (1-α)^k (no detach needed).
+                S = (1.0 - self.ttt_nlms_decay) * S_hist + dW_i
             down_proj = torch.stack(outs, dim=1)             # [b, chunk_num, c, d]
             delta_down_proj = torch.stack(per_chunk_dw, dim=1).to(h.dtype)  # [b, chunk_num, d, h_dim]
             self._record_ttt_future_chunk_aux(prediction_states, target_padded, x.shape[1])

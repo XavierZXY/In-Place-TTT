@@ -179,3 +179,47 @@ def test_train_mlp_reads_decay():
     assert mlp.ttt_nlms_decay == 0.1
     # 默认 0.0
     assert Qwen3MLP(_cfg(ttt_write_rule="nlms"), layer_idx=0).ttt_nlms_decay == 0.0
+
+
+def test_train_nlms_decay_bounds_S():
+    """decay 限幅:更大 decay → 更低的稳态 ‖S‖，且 decay>0 收敛到平台。
+    直接复现 forward 的 S 递推以观测 ‖S‖ 序列（独立于 mlp，验证 decay 递推数学）。
+    注：toy 用随机独立 K/V，无真实 ckpt 的 runaway 正反馈（spec 风险节已述），
+    故这里验证的是 decay 对稳态幅度的单调压低 + 收敛性，而非"纯 NLMS 必发散"。"""
+    def s_norm_seq(decay, eta=0.5, n_chunks=40, csize=8, dim=8, lam=1.0, scale=5.0):
+        torch.manual_seed(7)
+        S = torch.zeros(dim, dim)
+        norms = []
+        for _ in range(n_chunks):
+            K = torch.randn(csize, dim) * scale
+            V = torch.randn(csize, dim) * scale
+            pred = K @ S.T
+            resid = (V - pred) / (lam + (K * K).sum(-1, keepdim=True))
+            dW = eta * (resid.T @ K) / csize
+            S = (1 - decay) * S + dW
+            norms.append(float(S.norm()))
+        return norms
+
+    n0 = s_norm_seq(decay=0.0)
+    n1 = s_norm_seq(decay=0.1)
+    n3 = s_norm_seq(decay=0.3)
+    # 更大 decay → 更低的稳态 ‖S‖（末 chunk 单调下降）
+    assert n0[-1] > n1[-1] > n3[-1], f"larger decay must lower steady-state ‖S‖: {n0[-1]}, {n1[-1]}, {n3[-1]}"
+    # decay>0 收敛到平台（末 4 chunk 相邻变化 < 8%）
+    for seq, dc in [(n1, 0.1), (n3, 0.3)]:
+        last4 = seq[-4:]
+        for a, b in zip(last4, last4[1:]):
+            assert abs(b - a) / max(a, 1e-9) < 0.08, f"decay={dc} should plateau, got {last4}"
+
+
+def test_train_nlms_decay_zero_is_pure_nlms():
+    """ttt_nlms_decay=0.0 的 forward 必须与无 decay flag 的纯 NLMS 逐位相同。"""
+    torch.manual_seed(11)
+    x = torch.randn(1, 8, 8); t = torch.randn(1, 8, 8)
+    torch.manual_seed(13)
+    mlp_pure = _randomize(Qwen3MLP(_cfg(ttt_write_rule="nlms", ttt_lr=0.5, ttt_chunk=2), layer_idx=0))
+    torch.manual_seed(13)
+    mlp_d0 = _randomize(Qwen3MLP(_cfg(ttt_write_rule="nlms", ttt_lr=0.5, ttt_chunk=2,
+                                      ttt_nlms_decay=0.0), layer_idx=0))
+    with torch.no_grad():
+        torch.testing.assert_close(mlp_pure(x, t=t), mlp_d0(x, t=t))

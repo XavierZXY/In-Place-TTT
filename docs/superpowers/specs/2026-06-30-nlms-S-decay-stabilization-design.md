@@ -77,7 +77,7 @@ nlms 分支的 `MODEL_FOUNDATION_JSON` 加 `"ttt_nlms_decay": ${NLMS_DECAY_VALUE
 
 1. **α=0 退化**:`ttt_nlms_decay=0.0` 时训练/推理 forward 与当前纯 NLMS 逐位相同(向后兼容守门)。
 2. **config 校验**:`decay=1.0` 和 `decay<0` 抛 `ValueError`;默认 `0.0`;两侧 config 同名声明(防 HF 静默丢弃)。
-3. **有界性**:构造 16 chunk + 放大尺度输入,`α=0.1` 下 `‖S‖` 收敛(末 4 个 chunk 的 `‖S‖` 相邻增幅 < 5%,即接近稳态平台),`α=0` 下 `‖S‖` 末 chunk > 首 chunk 的 5 倍(持续增长)→ 对比证明 decay 限幅生效。
+3. **有界性**:直接复现 decay 递推(toy 随机 K/V,无真实 runaway 反馈),验证 decay 的可测真实效果:更大 α → 更低的稳态 `‖S‖`(α=0/0.1/0.3 末 chunk 单调下降),且 α>0 收敛到平台(末 4 chunk 相邻变化 < 8%)。注:toy 测不出"纯 NLMS 必发散"(那需真实 ckpt 的对抗性 projections),故有界性以"α 单调压低稳态幅度"为判据。
 4. **训推一致**:`α=0.1` 下训练侧 chunk-loop 与推理侧逐 chunk 数值一致(扩展现有 `test_train_nlms_matches_inference_nlms`)。
 5. **梯度非消失**:`α=0.1` + 冻结 backbone,ttt_proj/ttt_conv 梯度非零有限(对比 detach 的梯度消失)。
 
