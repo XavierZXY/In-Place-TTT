@@ -18,6 +18,27 @@ def _iter_decoder_layers(model):
     return list(getattr(inner_model, "layers", []))
 
 
+def ttt_lr_warmup_factor(step, warmup_steps, init, target):
+    """Linear warmup of the TTT write-rule lr. Stateless function of global_step.
+
+    step < warmup_steps: linearly interpolate init -> target.
+    step >= warmup_steps (or warmup_steps <= 0): target.
+    """
+    if warmup_steps <= 0:
+        return float(target)
+    frac = min(max(int(step), 0) / float(warmup_steps), 1.0)
+    return float(init) + (float(target) - float(init)) * frac
+
+
+def set_ttt_lr_effective(model, lr):
+    """Set ttt_lr_effective on every TTT MLP. Called each training step for warmup."""
+    lr = float(lr)
+    for layer in _iter_decoder_layers(model):
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None and hasattr(mlp, "ttt_lr_effective"):
+            mlp.ttt_lr_effective = lr
+
+
 @contextmanager
 def _temporary_training_mode(module, training: bool):
     module_states = [(child, child.training) for child in module.modules()]
