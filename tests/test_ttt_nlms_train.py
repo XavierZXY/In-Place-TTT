@@ -223,3 +223,45 @@ def test_train_nlms_decay_zero_is_pure_nlms():
                                       ttt_nlms_decay=0.0), layer_idx=0))
     with torch.no_grad():
         torch.testing.assert_close(mlp_pure(x, t=t), mlp_d0(x, t=t))
+
+
+def test_train_nlms_decay_matches_inference():
+    """decay>0 时训练侧 chunk-loop NLMS 必须与推理侧逐 chunk NLMS 数值一致。"""
+    from inference_model.hf_qwen3.configuration_qwen3 import Qwen3Config as InfConfig
+    from inference_model.hf_qwen3.modeling_qwen3 import Qwen3MLP as InfMLP
+    torch.manual_seed(0)
+    train_cfg = _cfg(ttt_write_rule="nlms", ttt_lr=0.5, ttt_nlms_lambda=1.0, ttt_chunk=2,
+                     ttt_nlms_decay=0.2)
+    inf_cfg = InfConfig(
+        vocab_size=32, hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=4, max_position_embeddings=64,
+        ttt_layers=[0], ttt_mode=True, ttt_proj=True, ttt_lr=0.5, ttt_chunk=2,
+        ttt_target="input_embed", ttt_write_rule="nlms", ttt_nlms_lambda=1.0, ttt_nlms_decay=0.2,
+    )
+    torch.manual_seed(1)
+    train_mlp = _randomize(Qwen3MLP(train_cfg, layer_idx=0))
+    torch.manual_seed(1)
+    inf_mlp = _randomize(InfMLP(inf_cfg, layer_idx=0))
+    x = torch.randn(1, 4, 8); t = torch.randn(1, 4, 8)
+    with torch.no_grad():
+        train_out = train_mlp(x, t=t)
+        inf_out, _ = inf_mlp(x, t=t)
+    torch.testing.assert_close(train_out, inf_out, rtol=1e-4, atol=1e-5)
+
+
+def test_train_nlms_decay_trains_under_frozen_backbone():
+    """decay>0(不开 detach)+ 冻结 backbone:loss 可微且 ttt_proj/ttt_conv 梯度非零有限。
+    对比 detach 的梯度消失（~1e-12），decay 的几何收敛应保留可见梯度。"""
+    torch.manual_seed(9)
+    x = torch.randn(1, 8, 8); t = torch.randn(1, 8, 8)
+    torch.manual_seed(9)
+    mlp = _randomize(Qwen3MLP(_cfg(ttt_write_rule="nlms", ttt_lr=0.5, ttt_chunk=2,
+                                   ttt_nlms_decay=0.1), layer_idx=0))
+    _freeze_backbone(mlp)
+    loss = mlp(x, t=t).float().pow(2).mean()
+    assert loss.requires_grad, "decay NLMS loss must require grad under frozen backbone"
+    loss.backward()
+    for name in ("ttt_proj", "ttt_conv"):
+        g = getattr(mlp, name).weight.grad
+        assert g is not None and g.norm() > 0, f"{name} must receive nonzero grad with decay"
+        assert torch.isfinite(g).all()
