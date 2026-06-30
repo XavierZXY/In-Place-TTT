@@ -190,6 +190,10 @@ class Qwen3Config(PretrainedConfig):
         ttt_target="hidden_states",
         ttt_prefill_update_partial=False,
         ttt_prefill_partial_min_tokens=1,
+        ttt_write_rule="outer",
+        ttt_nlms_lambda=1.0,
+        ttt_write_subchunk=0,
+        ttt_nlms_decay=0.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -249,6 +253,24 @@ class Qwen3Config(PretrainedConfig):
                 "ttt_prefill_partial_min_tokens must be >= 1, "
                 f"got {self.ttt_prefill_partial_min_tokens}"
             )
+        # Write rule for the TTT fast-weight update.
+        #   "outer" — original unbounded outer-product accumulation (cumsum).
+        #   "nlms"  — block residual write (normalized LMS / delta rule):
+        #             R = V - K S_delta^T ; dW = ttt_lr * R^T K / (ttt_nlms_lambda + tr(K^T K)).
+        # ttt_write_subchunk > 0 splits each ttt_chunk into serial sub-blocks for
+        # the write (mitigates intra-chunk dilution); 0 means write the whole chunk at once.
+        self.ttt_write_rule = str(ttt_write_rule)
+        if self.ttt_write_rule not in {"outer", "nlms"}:
+            raise ValueError("ttt_write_rule must be one of {'outer', 'nlms'}")
+        self.ttt_nlms_lambda = float(ttt_nlms_lambda)
+        self.ttt_write_subchunk = int(ttt_write_subchunk)
+        if self.ttt_write_subchunk < 0:
+            raise ValueError("ttt_write_subchunk must be >= 0")
+        # Decay gate for the NLMS fast-weight state: ΔW <- (1 - decay) * ΔW + dW.
+        # Bounds the accumulated delta to break runaway feedback; 0.0 = pure NLMS.
+        self.ttt_nlms_decay = float(ttt_nlms_decay)
+        if not (0.0 <= self.ttt_nlms_decay < 1.0):
+            raise ValueError("ttt_nlms_decay must be in [0.0, 1.0)")
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,

@@ -155,3 +155,20 @@ def test_nlms_detach_state_trains_under_frozen_backbone():
         g = getattr(mlp, name).weight.grad
         assert g is not None and g.norm() > 0, f"{name} must receive nonzero grad under detach"
         assert torch.isfinite(g).all()
+
+
+def test_nlms_decay_flag_declared_and_validated():
+    """ttt_nlms_decay 必须两侧 config 同名声明(防 HF 静默丢弃),默认 0.0,范围 [0,1)。"""
+    from inference_model.hf_qwen3.configuration_qwen3 import Qwen3Config as InfConfig
+    # 默认 0.0
+    assert _cfg().ttt_nlms_decay == 0.0
+    assert InfConfig(vocab_size=32, hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                     num_attention_heads=2, num_key_value_heads=1, head_dim=4,
+                     max_position_embeddings=64).ttt_nlms_decay == 0.0
+    # 合法值
+    assert _cfg(ttt_nlms_decay=0.1).ttt_nlms_decay == 0.1
+    # 非法值抛错
+    with pytest.raises(ValueError):
+        _cfg(ttt_nlms_decay=1.0)
+    with pytest.raises(ValueError):
+        _cfg(ttt_nlms_decay=-0.1)

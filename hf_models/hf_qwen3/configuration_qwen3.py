@@ -192,6 +192,7 @@ class Qwen3Config(PretrainedConfig):
         ttt_write_rule="outer",
         ttt_nlms_lambda=1.0,
         ttt_nlms_detach_state=False,
+        ttt_nlms_decay=0.0,
         ttt_compress_window=0,
         ttt_aux_loss_weight=0.0,
         ttt_aux_target="next_input_embed",
@@ -268,6 +269,12 @@ class Qwen3Config(PretrainedConfig):
             raise ValueError("ttt_write_rule must be one of {'outer', 'nlms'}")
         self.ttt_nlms_lambda = float(ttt_nlms_lambda)
         self.ttt_nlms_detach_state = bool(ttt_nlms_detach_state)
+        # Decay gate for the NLMS fast-weight state: S <- (1 - decay) * S + dW.
+        # Bounds ||S|| (~||dW||/decay) to break the runaway readout-residual
+        # feedback. decay=0.0 is bit-identical to pure NLMS (unbounded accumulation).
+        self.ttt_nlms_decay = float(ttt_nlms_decay)
+        if not (0.0 <= self.ttt_nlms_decay < 1.0):
+            raise ValueError("ttt_nlms_decay must be in [0.0, 1.0)")
         self.ttt_target = ttt_target
         if self.ttt_target not in {"hidden_states", "input_embed"}:
             raise ValueError("ttt_target must be one of {'hidden_states', 'input_embed'}")
