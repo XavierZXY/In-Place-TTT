@@ -76,3 +76,16 @@ def test_train_nlms_eta_zero_is_base():
         h = mlp.act_fn(mlp.gate_proj(x)) * mlp.up_proj(x)
         base = torch.nn.functional.linear(h, mlp.down_proj.weight, mlp.down_proj.bias)
     torch.testing.assert_close(out, base, rtol=1e-4, atol=1e-5)
+
+
+def test_train_outer_flag_unchanged():
+    """显式 ttt_write_rule=outer 必须与默认(无 nlms)的 cumsum 路径 bit 级一致。"""
+    torch.manual_seed(3)
+    x = torch.randn(1, 4, 8)
+    t = torch.randn(1, 4, 8)
+    torch.manual_seed(5)
+    mlp_default = _randomize(Qwen3MLP(_cfg(ttt_chunk=2), layer_idx=0))           # no flag → outer
+    torch.manual_seed(5)
+    mlp_outer = _randomize(Qwen3MLP(_cfg(ttt_write_rule="outer", ttt_chunk=2), layer_idx=0))
+    with torch.no_grad():
+        torch.testing.assert_close(mlp_default(x, t=t), mlp_outer(x, t=t))
