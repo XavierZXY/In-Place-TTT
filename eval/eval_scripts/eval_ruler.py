@@ -350,6 +350,24 @@ def apply_ttt_runtime_overrides(
                 )
             config.ttt_prefill_partial_min_tokens = int(ttt_prefill_partial_min_tokens)
 
+    # Write-rule overrides (R001/R002): select the TTT write rule without editing
+    # the checkpoint config. Env vars keep the sharded runner (which spawns
+    # subprocesses) working without extra CLI plumbing.
+    write_rule = os.getenv("TTT_WRITE_RULE")
+    if write_rule:
+        if write_rule not in {"outer", "nlms"}:
+            raise ValueError(f"TTT_WRITE_RULE must be outer|nlms, got {write_rule!r}")
+        config.ttt_write_rule = write_rule
+        print(f"[load] TTT_WRITE_RULE override -> {write_rule}")
+    nlms_lambda = os.getenv("TTT_NLMS_LAMBDA")
+    if nlms_lambda:
+        config.ttt_nlms_lambda = float(nlms_lambda)
+        print(f"[load] TTT_NLMS_LAMBDA override -> {nlms_lambda}")
+    write_subchunk = os.getenv("TTT_WRITE_SUBCHUNK")
+    if write_subchunk:
+        config.ttt_write_subchunk = int(write_subchunk)
+        print(f"[load] TTT_WRITE_SUBCHUNK override -> {write_subchunk}")
+
 
 def load_model(
     model_path: str,
